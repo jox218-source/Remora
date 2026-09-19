@@ -37,6 +37,9 @@ test('Codex adapter isolates profiles, streams results, routes permissions, reco
   try {
     const statuses = await Promise.all([provider.status(one), provider.status(two)]);
     assert.notEqual(statuses[0].identity, statuses[1].identity);
+    const models = await provider.models(one);
+    assert.equal(models[0].model, 'fixture-model');
+    assert.equal(models[0].supportedReasoningEfforts[0].effort, 'medium');
     assert.ok(
       existsSync(join(home, 'profiles', 'one')) && existsSync(join(home, 'profiles', 'two')),
     );
@@ -53,6 +56,9 @@ test('Codex adapter isolates profiles, streams results, routes permissions, reco
     const sessionPermission = await provider.run({ ...run, prompt: 'APPROVAL' });
     assert.equal(sessionPermission, 'acceptForSession');
     assert.equal(approvals, 2);
+    const filePermission = await provider.run({ ...run, prompt: 'FILE_APPROVAL' });
+    assert.equal(filePermission, 'acceptForSession');
+    assert.equal(approvals, 3);
     const recovered = await provider.reconcile({
       account: 'one',
       threadId: 'thread-1',
@@ -67,16 +73,67 @@ test('Codex adapter isolates profiles, streams results, routes permissions, reco
     assert.throws(() => process.kill(priorPid, 0), /ESRCH/);
     const controller = new AbortController();
     const blocked = provider.run({ ...run, prompt: 'HANG', signal: controller.signal });
+    const activePid = Number(
+      readFileSync(join(home, 'profiles', 'one', 'fixture-pid.txt'), 'utf8'),
+    );
     const rejection = assert.rejects(blocked, /cancelled/);
     await setTimeout(100);
     controller.abort();
     await rejection;
+    assert.throws(() => process.kill(activePid, 0), /ESRCH/);
     assert.equal((await provider.status(one)).identity, 'one@example.invalid');
     provider.status = async () => ({ status: 'connected', authType: 'apiKey' });
     await assert.rejects(
       () => provider.run({ ...run, account: { ...one, boundIdentity: 'one@example.invalid' } }),
       /identity changed/,
     );
+  } finally {
+    await provider.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Codex adapter treats expired login and exhausted usage as unavailable in isolated profiles', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'remora-recovery-'));
+  const provider = new CodexProvider(
+    home,
+    async () => 'decline',
+    () => {},
+    process.execPath,
+    [resolve('tests/fixtures/codex.mjs')],
+  );
+  const expired = { id: 'expired-login', provider: 'codex' as const, status: 'connected' };
+  const exhausted = { id: 'exhausted-usage', provider: 'codex' as const, status: 'connected' };
+  const allowedPrimaryFull = {
+    id: 'allowed-primary-full',
+    provider: 'codex' as const,
+    status: 'connected',
+  };
+  const base = (account: typeof expired): RunRequest => ({
+    projectId: 'recovery',
+    account,
+    cwd: home,
+    prompt: 'test',
+    readOnly: true,
+    network: false,
+    signal: new AbortController().signal,
+    onSession() {},
+    onEvent() {},
+  });
+  try {
+    const expiredStatus = await provider.status(expired);
+    assert.equal(expiredStatus.status, 'signed-out');
+    await assert.rejects(() => provider.run(base(expired)), /no longer connected/);
+
+    const exhaustedStatus = await provider.status(exhausted);
+    assert.equal(exhaustedStatus.status, 'connected');
+    assert.equal((exhaustedStatus.usage as any).ordinaryUsageAllowed, false);
+    await assert.rejects(() => provider.run(base(exhausted)), /usage allowance is exhausted/);
+
+    const allowedStatus = await provider.status(allowedPrimaryFull);
+    assert.equal((allowedStatus.usage as any).ordinaryUsageAllowed, true);
+    assert.equal((allowedStatus.usage as any).rateLimits.primary.usedPercent, 100);
+    assert.equal(await provider.run(base(allowedPrimaryFull)), 'Simulated protocol response');
   } finally {
     await provider.close();
     rmSync(home, { recursive: true, force: true });

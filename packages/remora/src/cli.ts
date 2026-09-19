@@ -171,6 +171,11 @@ program
   .requiredOption('--workers <accounts>', 'Comma-separated worker account aliases')
   .option('--name <name>', 'Project display name')
   .option('--network', 'Allow worker network access', false)
+  .option(
+    '--sandbox-only',
+    'Run provider turns inside the task sandbox without escalation prompts',
+    false,
+  )
   .option('--concurrency <number>', 'Maximum active project turns', '4')
   .action(async (path = '.', options) => {
     const root = resolve(path);
@@ -181,6 +186,7 @@ program
         lead: options.lead,
         workers: options.workers.split(',').map((v: string) => v.trim()),
         network: options.network,
+        approvalPolicy: options.sandboxOnly ? 'never' : 'on-request',
         maxConcurrency: Number(options.concurrency),
       }),
     );

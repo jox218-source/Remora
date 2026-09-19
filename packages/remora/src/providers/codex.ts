@@ -1,6 +1,6 @@
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import type { Account, Provider, RunRequest, SessionRef } from '../types.js';
+import type { Account, ModelOption, Provider, RunRequest, SessionRef } from '../types.js';
 import { RpcClient } from './rpc.js';
 
 type RequestApproval = (
@@ -88,6 +88,52 @@ export class CodexProvider implements Provider {
       checkedAt: new Date().toISOString(),
     };
   }
+  async models(account: Account): Promise<ModelOption[]> {
+    const rpc = await this.client(account.id);
+    const models: ModelOption[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 10; page++) {
+      const result = (await rpc.request('model/list', {
+        includeHidden: false,
+        limit: 100,
+        ...(cursor ? { cursor } : {}),
+      })) as { data?: unknown[]; nextCursor?: unknown };
+      for (const value of result.data ?? []) {
+        if (!value || typeof value !== 'object') continue;
+        const model = value as Record<string, unknown>;
+        if (typeof model.id !== 'string' || typeof model.model !== 'string') continue;
+        const efforts = Array.isArray(model.supportedReasoningEfforts)
+          ? model.supportedReasoningEfforts.flatMap((effort) => {
+              if (!effort || typeof effort !== 'object') return [];
+              const option = effort as Record<string, unknown>;
+              return typeof option.reasoningEffort === 'string'
+                ? [
+                    {
+                      effort: option.reasoningEffort,
+                      ...(typeof option.description === 'string'
+                        ? { description: option.description }
+                        : {}),
+                    },
+                  ]
+                : [];
+            })
+          : [];
+        models.push({
+          id: model.id,
+          model: model.model,
+          displayName: typeof model.displayName === 'string' ? model.displayName : model.model,
+          description: typeof model.description === 'string' ? model.description : '',
+          supportedReasoningEfforts: efforts,
+          defaultReasoningEffort:
+            typeof model.defaultReasoningEffort === 'string' ? model.defaultReasoningEffort : '',
+          isDefault: model.isDefault === true,
+        });
+      }
+      cursor = typeof result.nextCursor === 'string' ? result.nextCursor : undefined;
+      if (!cursor) break;
+    }
+    return models;
+  }
   async login(account: Account) {
     const result = await (
       await this.client(account.id)
@@ -111,6 +157,16 @@ export class CodexProvider implements Provider {
     if (run.account.status === 'identity-mismatch')
       throw new Error('Provider identity mismatch; explicitly rebind this account before running');
     if (observed.status !== 'connected') throw new Error('Provider account is no longer connected');
+    const usage = observed.usage as
+      | {
+          ordinaryUsageAllowed?: unknown;
+        }
+      | null
+      | undefined;
+    if (usage?.ordinaryUsageAllowed === false)
+      throw new Error(
+        'Provider account usage allowance is exhausted; wait for its reset before retrying',
+      );
     const boundIdentity = run.account.boundIdentity ?? run.account.identity;
     if (
       boundIdentity &&
@@ -121,7 +177,7 @@ export class CodexProvider implements Provider {
     const start = await rpc.request('thread/start', {
       cwd: run.cwd,
       model: run.account.model ?? null,
-      approvalPolicy: 'on-request',
+      approvalPolicy: run.approvalPolicy ?? 'on-request',
       sandbox: run.readOnly ? 'read-only' : 'workspace-write',
       config: { 'features.multi_agent': false },
       developerInstructions:
@@ -250,11 +306,17 @@ export class CodexProvider implements Provider {
           threadId,
           input: [{ type: 'text', text: run.prompt, text_elements: [] }],
           cwd: run.cwd,
-          approvalPolicy: 'on-request',
+          approvalPolicy: run.approvalPolicy ?? 'on-request',
           model: run.account.model ?? null,
           sandboxPolicy: run.readOnly
-            ? { type: 'readOnly' }
-            : { type: 'workspaceWrite', writableRoots: [run.cwd], networkAccess: run.network },
+            ? { type: 'readOnly', networkAccess: run.network }
+            : {
+                type: 'workspaceWrite',
+                writableRoots: [run.cwd],
+                networkAccess: run.network,
+                excludeTmpdirEnvVar: true,
+                excludeSlashTmp: true,
+              },
           ...(run.schema ? { outputSchema: run.schema } : {}),
         })
         .then((result) => {

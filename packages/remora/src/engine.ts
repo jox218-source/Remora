@@ -154,6 +154,28 @@ export class Engine {
       this.statusBusy.delete(id);
     }
   }
+  async models(id: string) {
+    const account = this.account(id);
+    const provider = this.providers[account.provider];
+    if (!provider.models) return [];
+    return provider.models(account);
+  }
+  updateAccountModel(id: string, model?: string | null) {
+    const account = this.account(id);
+    if (
+      this.authBusy.has(id) ||
+      this.loginPending.has(id) ||
+      account.status === 'quarantined' ||
+      [...this.active.values()].some((active) => active.account === id)
+    )
+      throw new Error('Account is busy; wait for active work to finish');
+    if (model != null && !model.trim()) throw new Error('Model must be a non-empty string');
+    account.model = model == null ? undefined : model.trim();
+    this.bump(id);
+    this.store.put('accounts', account);
+    this.store.log('account', `Updated model selection for ${id}`);
+    return account;
+  }
   private async refreshAccounts() {
     await Promise.allSettled(
       this.store.list<Account>('accounts').map((account) => this.refreshAccount(account.id)),
@@ -230,6 +252,7 @@ export class Engine {
         workers: z.array(aliasSchema).min(1),
         maxConcurrency: z.number().int().min(1).max(16).default(4),
         network: z.boolean().default(false),
+        approvalPolicy: z.enum(['on-request', 'never']).default('on-request'),
       })
       .parse(input);
     [data.lead, ...data.workers].forEach((id) => this.account(id));
@@ -242,6 +265,7 @@ export class Engine {
       goal: '',
       tasks: [],
       maxRevisions: 2,
+      approvalPolicy: data.approvalPolicy,
       createdAt: new Date().toISOString(),
     };
     this.save(project);
@@ -305,6 +329,38 @@ export class Engine {
     project.state = 'approved';
     this.save(project);
     this.store.log('approval', 'User approved the plan and configured workspace permissions', id);
+    return project;
+  }
+  updateTeam(id: string, lead: string, workers: string[]) {
+    const project = this.project(id);
+    if (!['idle', 'draft', 'paused'].includes(project.state))
+      throw new Error('Team changes are only allowed for idle, draft, or paused projects');
+    if (
+      project.state === 'paused' &&
+      [...this.active.values()].some((active) => active.projectId === id)
+    )
+      throw new Error('Wait for active project work to settle before changing its team');
+    const uniqueWorkers = [...new Set(workers)];
+    if (!uniqueWorkers.length) throw new Error('Choose at least one worker account');
+    this.account(lead);
+    uniqueWorkers.forEach((account) => this.account(account));
+    if (project.state === 'draft') {
+      delete project.plan;
+      project.tasks = [];
+      project.state = 'idle';
+      project.error = 'Team changed; create a new plan before running this project';
+    } else if (project.state === 'paused') {
+      const eligible = new Set(uniqueWorkers);
+      const queued = project.tasks.filter((task) =>
+        ['pending', 'review', 'reviewing', 'running', 'interrupted'].includes(task.status),
+      );
+      if (queued.some((task) => !eligible.has(task.account)))
+        throw new Error('The new worker team does not include an account assigned to queued work');
+    }
+    project.lead = lead;
+    project.workers = uniqueWorkers;
+    this.save(project);
+    this.store.log('team', `Updated project lead and worker team`, id);
     return project;
   }
   start(id: string) {
@@ -410,6 +466,7 @@ export class Engine {
         projectId: project.id,
         account,
         network: project.network,
+        approvalPolicy: project.approvalPolicy ?? 'on-request',
         onEvent: (message) =>
           this.store.log('provider', message, project.id, options.taskId, accountId),
         onIdentity: (identity, checkedAt) => {

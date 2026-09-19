@@ -38,6 +38,13 @@ type AccountUsage = {
   rateLimitsByLimitId?: Record<string, UsageWindow>;
   rateLimits?: Record<string, UsageWindow> | UsageWindow;
 };
+type ModelOption = {
+  id: string;
+  model: string;
+  displayName: string;
+  description?: string;
+  isDefault?: boolean;
+};
 type Account = {
   id: string;
   provider: 'codex' | 'demo';
@@ -59,6 +66,7 @@ type Task = {
   acceptance?: string[];
   status?: string;
   revision?: number;
+  workspace?: string;
   feedback?: string;
   result?: string;
   session?: { account?: string; threadId?: string };
@@ -82,6 +90,7 @@ type Project = {
   tasks: Task[];
   maxConcurrency: number;
   network: boolean;
+  approvalPolicy?: 'on-request' | 'never';
   staging?: string;
   integrationBranch?: string;
   error?: string;
@@ -525,17 +534,38 @@ function EventRow({ event }: { event: Event }) {
     </div>
   );
 }
-function approvalScope(details: unknown) {
-  if (!details || typeof details !== 'object') return 'Requested scope is available below.';
+function approvalAction(method: string) {
+  if (method.includes('commandExecution')) return 'Run a command';
+  if (method.includes('fileChange')) return 'Change a file';
+  return 'Provider action';
+}
+function approvalDetails(details: unknown) {
+  return typeof details === 'string' ? details : JSON.stringify(details, null, 2);
+}
+function approvalPaths(details: unknown) {
+  if (!details || typeof details !== 'object') return [];
   const value = details as Record<string, unknown>;
-  const command = typeof value.command === 'string' ? value.command : undefined;
-  const cwd = typeof value.cwd === 'string' ? value.cwd : undefined;
-  const grantRoot = typeof value.grantRoot === 'string' ? value.grantRoot : undefined;
-  if (command)
-    return `Command: ${command.slice(0, 240)}${command.length > 240 ? '…' : ''}${cwd ? ` · cwd: ${cwd}` : ''}`;
-  if (grantRoot) return `Requested file access root: ${grantRoot}`;
-  if (typeof value.reason === 'string') return `Reason: ${value.reason}`;
-  return 'Requested scope is available below.';
+  return ['cwd', 'path', 'file', 'grantRoot', 'root', 'scope'].flatMap((key) =>
+    typeof value[key] === 'string' ? [value[key] as string] : [],
+  );
+}
+function approvalScopeStatus(details: unknown, task?: Task) {
+  const paths = approvalPaths(details);
+  if (!task?.workspace || !paths.length) return 'unknown' as const;
+  const workspaceRoot = task.workspace.replace(/[\\/]+$/, '').toLowerCase();
+  for (const path of paths) {
+    const isAbsolute =
+      /^[a-z]:[\\/]/i.test(path) || path.startsWith('/') || path.startsWith('\\\\');
+    if (!isAbsolute) return 'unknown' as const;
+    const normalized = path.replace(/[\\/]+$/, '').toLowerCase();
+    if (
+      normalized !== workspaceRoot &&
+      !normalized.startsWith(`${workspaceRoot}\\`) &&
+      !normalized.startsWith(`${workspaceRoot}/`)
+    )
+      return 'outside' as const;
+  }
+  return 'inside' as const;
 }
 function ApprovalBar({
   approvals,
@@ -551,7 +581,7 @@ function ApprovalBar({
       approval.details && typeof approval.details === 'object'
         ? (approval.details as { availableDecisions?: unknown }).availableDecisions
         : undefined;
-    return !Array.isArray(decisions) || decisions.includes('acceptForSession');
+    return Array.isArray(decisions) && decisions.includes('acceptForSession');
   };
   return (
     <section className="approval-bar">
@@ -564,77 +594,84 @@ function ApprovalBar({
       </div>
       {approvals.map((approval) => (
         <div className="approval-item" key={approval.id}>
-          <div>
-            <small>
-              Project:{' '}
-              {projects.find((project) => project.id === approval.projectId)?.name ?? 'Unknown'}
-              {' · '}
-              {approval.projectId}
-            </small>
-            <strong>
-              {approval.method.includes('commandExecution')
-                ? 'Run a provider command'
-                : approval.method.includes('fileChange')
-                  ? 'Change a provider file'
-                  : 'Provider action needs approval'}
-            </strong>
-            <small>
-              Account {approval.account}
-              {approval.taskId ? ` · ${approval.taskId}` : ''} · provider task session
-            </small>
-            <small>
-              Why: the provider requested permission to continue. Review the requested command,
-              path, and permissions below.
-            </small>
-            <small>{approvalScope(approval.details)}</small>
-            <details>
-              <summary>Technical details</summary>
-              <pre>
-                {typeof approval.details === 'string'
-                  ? approval.details
-                  : JSON.stringify(approval.details, null, 2)}
-              </pre>
-            </details>
-          </div>
-          <div className="approval-actions">
-            <button
-              className="button small secondary"
-              onClick={() =>
-                act(`decline-${approval.id}`, () =>
-                  post(`/api/approvals/${encodeURIComponent(approval.id)}`, {
-                    decision: 'decline',
-                  }),
-                )
-              }
-            >
-              <X size={14} /> Decline
-            </button>
-            <button
-              className="button small primary"
-              onClick={() =>
-                act(`accept-${approval.id}`, () =>
-                  post(`/api/approvals/${encodeURIComponent(approval.id)}`, { decision: 'accept' }),
-                )
-              }
-            >
-              <Check size={14} /> Allow once
-            </button>
-            {canAcceptForSession(approval) && (
-              <button
-                className="button small primary"
-                title="Allow matching requests for this provider task session only"
-                onClick={() =>
-                  act(`session-${approval.id}`, () =>
-                    post(`/api/approvals/${encodeURIComponent(approval.id)}`, {
-                      decision: 'acceptForSession',
-                    }),
-                  )
-                }
-              >
-                <ShieldCheck size={14} /> Allow for this task
-              </button>
-            )}
-          </div>
+          {(() => {
+            const project = projects.find((candidate) => candidate.id === approval.projectId);
+            const task = project?.tasks.find((candidate) => candidate.id === approval.taskId);
+            const scopeStatus = approvalScopeStatus(approval.details, task);
+            return (
+              <>
+                <div>
+                  <small className="approval-project">{project?.name ?? 'Unknown project'}</small>
+                  <strong>{approvalAction(approval.method)}</strong>
+                  <small className="approval-context">
+                    Account <b>{approval.account}</b>
+                    {' · '}
+                    Task <b>{task?.title ?? approval.taskId ?? 'Unknown task'}</b>
+                  </small>
+                  {scopeStatus === 'outside' && (
+                    <p className="approval-warning">
+                      Warning: this request reaches outside the assigned task workspace. Review the
+                      scope before allowing it.
+                    </p>
+                  )}
+                  {scopeStatus === 'unknown' && (
+                    <p className="approval-warning approval-warning-unknown">
+                      Scope could not be verified for this request. Review the technical details
+                      before allowing it.
+                    </p>
+                  )}
+                  <details className="approval-details">
+                    <summary>Review technical details</summary>
+                    <div className="approval-technical">
+                      <div>Project ID: {approval.projectId}</div>
+                      <pre>{approvalDetails(approval.details)}</pre>
+                    </div>
+                  </details>
+                </div>
+                <div className="approval-actions">
+                  <button
+                    className="button small secondary"
+                    onClick={() =>
+                      act(`decline-${approval.id}`, () =>
+                        post(`/api/approvals/${encodeURIComponent(approval.id)}`, {
+                          decision: 'decline',
+                        }),
+                      )
+                    }
+                  >
+                    <X size={14} /> Decline
+                  </button>
+                  <button
+                    className="button small primary"
+                    onClick={() =>
+                      act(`accept-${approval.id}`, () =>
+                        post(`/api/approvals/${encodeURIComponent(approval.id)}`, {
+                          decision: 'accept',
+                        }),
+                      )
+                    }
+                  >
+                    <Check size={14} /> Allow once
+                  </button>
+                  {canAcceptForSession(approval) && (
+                    <button
+                      className="button small primary"
+                      title="Allow matching requests for this provider task session only"
+                      onClick={() =>
+                        act(`session-${approval.id}`, () =>
+                          post(`/api/approvals/${encodeURIComponent(approval.id)}`, {
+                            decision: 'acceptForSession',
+                          }),
+                        )
+                      }
+                    >
+                      <ShieldCheck size={14} /> Allow for this task
+                    </button>
+                  )}
+                </div>
+              </>
+            );
+          })()}
         </div>
       ))}
     </section>
@@ -669,6 +706,102 @@ function usageText(usage?: AccountUsage | null) {
   return rendered.length ? rendered.join(' · ') : 'Usage unavailable';
 }
 
+function AccountModelControl({
+  account,
+  act,
+  busy,
+}: {
+  account: Account;
+  act: (k: string, fn: () => Promise<unknown>) => Promise<void>;
+  busy: string;
+}) {
+  const [models, setModels] = useState<ModelOption[]>([]);
+  const [loading, setLoading] = useState(account.provider === 'codex');
+  const [error, setError] = useState('');
+  useEffect(() => {
+    let cancelled = false;
+    if (account.provider !== 'codex') {
+      setLoading(false);
+      setModels([]);
+      return;
+    }
+    setLoading(true);
+    setError('');
+    void api<unknown>(`/api/accounts/${encodeURIComponent(account.id)}/models`)
+      .then((payload) => {
+        if (cancelled) return;
+        const values = Array.isArray(payload)
+          ? payload
+          : payload &&
+              typeof payload === 'object' &&
+              Array.isArray((payload as { models?: unknown }).models)
+            ? (payload as { models: unknown[] }).models
+            : [];
+        setModels(
+          values.flatMap((value) => {
+            if (!value || typeof value !== 'object') return [];
+            const model = value as Record<string, unknown>;
+            if (typeof model.model !== 'string' || typeof model.id !== 'string') return [];
+            return [
+              {
+                id: model.id,
+                model: model.model,
+                displayName:
+                  typeof model.displayName === 'string' ? model.displayName : model.model,
+                description: typeof model.description === 'string' ? model.description : '',
+                isDefault: model.isDefault === true,
+              },
+            ];
+          }),
+        );
+      })
+      .catch((e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : 'Models unavailable');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [account.id, account.provider]);
+  const modelOptions = models.length
+    ? models
+    : account.model
+      ? [{ id: account.model, model: account.model, displayName: account.model }]
+      : [];
+  return (
+    <label className="account-model">
+      Model
+      <select
+        value={account.model ?? ''}
+        disabled={loading || Boolean(error) || busy === `model-${account.id}`}
+        title={error || undefined}
+        onChange={(e) =>
+          act(`model-${account.id}`, () =>
+            post(`/api/accounts/${encodeURIComponent(account.id)}/settings`, {
+              model: e.target.value || null,
+            }),
+          )
+        }
+      >
+        <option value="">Provider default</option>
+        {modelOptions.map((model) => (
+          <option key={model.id} value={model.model}>
+            {model.displayName}
+            {model.isDefault ? ' (default)' : ''}
+          </option>
+        ))}
+      </select>
+      <small>
+        {loading
+          ? 'Loading provider models…'
+          : error || 'Choose a provider model or use the default.'}
+      </small>
+    </label>
+  );
+}
+
 function Accounts({
   accounts,
   projects,
@@ -682,7 +815,8 @@ function Accounts({
   act: (k: string, fn: () => Promise<unknown>) => Promise<void>;
   busy: string;
 }) {
-  const [form, setForm] = useState({ id: '', provider: 'codex', model: '' });
+  const [form, setForm] = useState({ id: '', provider: 'codex' });
+  const [removeConfirm, setRemoveConfirm] = useState<string>();
   const identityCounts = new Map<string, number>();
   accounts.forEach((account) => {
     if (account.identity)
@@ -698,8 +832,8 @@ function Accounts({
     e.preventDefault();
     if (!form.id) return;
     act('add-account', async () => {
-      await post('/api/accounts', { ...form, model: form.model || undefined });
-      setForm({ id: '', provider: 'codex', model: '' });
+      await post('/api/accounts', form);
+      setForm({ id: '', provider: 'codex' });
     });
   };
   return (
@@ -752,6 +886,7 @@ function Accounts({
               </span>
               <span>{usageText(a.usage)}</span>
             </div>
+            <AccountModelControl account={a} act={act} busy={busy} />
             {a.identity && identityCounts.get(a.identity)! > 1 && (
               <div className="account-warning">
                 <AlertCircle size={13} /> Duplicate provider identity detected; do not run an
@@ -778,7 +913,10 @@ function Accounts({
                       (task) =>
                         (task.status === 'running' && task.account === a.id) ||
                         (task.status === 'reviewing' && project.lead === a.id) ||
-                        (task.status === 'review' && project.lead === a.id),
+                        (task.status === 'review' &&
+                          (project.lead === a.id ||
+                            ((task.account ?? task.session?.account) === a.id &&
+                              project.lead !== a.id))),
                     )
                     .map((task) => ({ project, task })),
                 )
@@ -787,9 +925,11 @@ function Accounts({
                   <span key={`${project.id}-${task.id}`}>
                     {task.status === 'reviewing'
                       ? 'Reviewing'
-                      : task.status === 'review'
+                      : task.status === 'review' && project.lead === a.id
                         ? 'Queued for review'
-                        : 'Working on'}{' '}
+                        : task.status === 'review'
+                          ? 'Work complete — awaiting lead review · available'
+                          : 'Working on'}{' '}
                     <strong>{task.title}</strong> · {project.name}
                   </span>
                 ))}
@@ -800,7 +940,9 @@ function Accounts({
                     (task) =>
                       (task.status === 'running' && task.account === a.id) ||
                       (['reviewing', 'review'].includes(task.status || '') &&
-                        project.lead === a.id),
+                        (project.lead === a.id ||
+                          (task.status === 'review' &&
+                            (task.account ?? task.session?.account) === a.id))),
                   ),
               ) && <span>Idle · no active task</span>}
               {events
@@ -845,6 +987,13 @@ function Accounts({
                 }
               >
                 <LogOut size={14} />
+              </button>
+              <button
+                className="button small danger"
+                onClick={() => setRemoveConfirm(a.id)}
+                disabled={busy === `remove-${a.id}`}
+              >
+                <X size={14} /> Remove account
               </button>
             </div>
           </div>
@@ -892,14 +1041,6 @@ function Accounts({
               <option value="demo">Demo</option>
             </select>
           </label>
-          <label>
-            Model <span className="optional">optional</span>
-            <input
-              value={form.model}
-              onChange={(e) => setForm({ ...form, model: e.target.value })}
-              placeholder="gpt-5.6"
-            />
-          </label>
           <button className="button primary" disabled={busy === 'add-account'}>
             {busy === 'add-account' ? (
               <LoaderCircle className="spin" size={16} />
@@ -937,6 +1078,45 @@ function Accounts({
           </div>
         </div>
       )}
+      {removeConfirm &&
+        (() => {
+          const account = accounts.find((candidate) => candidate.id === removeConfirm);
+          if (!account) return null;
+          return (
+            <div className="modal-backdrop">
+              <div className="modal">
+                <button className="modal-close" onClick={() => setRemoveConfirm(undefined)}>
+                  <X size={17} />
+                </button>
+                <span className="modal-icon">
+                  <X size={19} />
+                </span>
+                <h2>Remove {account.id}?</h2>
+                <p>
+                  Remora will log out this local provider session and remove its local registration.
+                  Your provider or cloud account will not be deleted.
+                </p>
+                <div className="modal-actions">
+                  <button className="button secondary" onClick={() => setRemoveConfirm(undefined)}>
+                    Keep account
+                  </button>
+                  <button
+                    className="button danger"
+                    disabled={busy === `remove-${account.id}`}
+                    onClick={() => {
+                      setRemoveConfirm(undefined);
+                      void act(`remove-${account.id}`, () =>
+                        post(`/api/accounts/${encodeURIComponent(account.id)}/remove`),
+                      );
+                    }}
+                  >
+                    Remove local account
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
     </>
   );
 }
@@ -964,6 +1144,7 @@ function Projects({
     lead: '',
     workers: [] as string[],
     network: false,
+    approvalPolicy: 'on-request' as 'on-request' | 'never',
     maxConcurrency: 4,
   });
   useEffect(() => setGoal(selected?.goal || ''), [selected?.id, selected?.goal]);
@@ -1052,6 +1233,7 @@ function Projects({
         {selected && (
           <ProjectDetail
             project={selected}
+            accounts={state.accounts}
             goal={goal}
             setGoal={setGoal}
             act={act}
@@ -1146,6 +1328,21 @@ function Projects({
                   />{' '}
                   Allow network access
                 </label>
+                <label>
+                  Permission mode
+                  <select
+                    value={form.approvalPolicy}
+                    onChange={(e) =>
+                      setForm({
+                        ...form,
+                        approvalPolicy: e.target.value as 'on-request' | 'never',
+                      })
+                    }
+                  >
+                    <option value="on-request">Ask when more access is needed</option>
+                    <option value="never">Sandbox only — stop if more access is needed</option>
+                  </select>
+                </label>
               </div>
               <button
                 className="button primary"
@@ -1167,6 +1364,7 @@ function Projects({
 }
 function ProjectDetail({
   project,
+  accounts,
   goal,
   setGoal,
   act,
@@ -1175,6 +1373,7 @@ function ProjectDetail({
   projectAction,
 }: {
   project: Project;
+  accounts: Account[];
   goal: string;
   setGoal: (v: string) => void;
   act: (k: string, fn: () => Promise<unknown>) => Promise<void>;
@@ -1186,6 +1385,27 @@ function ProjectDetail({
   const planReady = Boolean(project.plan);
   const canRun = ['approved', 'paused'].includes(project.state);
   const [confirmAccept, setConfirmAccept] = useState(false);
+  const [editingTeam, setEditingTeam] = useState(false);
+  const [teamForm, setTeamForm] = useState({ lead: project.lead, workers: project.workers });
+  const teamEditable = ['idle', 'draft', 'paused'].includes(project.state);
+  useEffect(() => {
+    setTeamForm({ lead: project.lead, workers: project.workers });
+    setEditingTeam(false);
+  }, [project.id, project.lead, project.workers.join(',')]);
+  const toggleTeamWorker = (id: string) =>
+    setTeamForm((current) => ({
+      ...current,
+      workers: current.workers.includes(id)
+        ? current.workers.filter((worker) => worker !== id)
+        : [...current.workers, id],
+    }));
+  const saveTeam = () => {
+    if (!teamForm.lead || !teamForm.workers.length) return;
+    void act('team', async () => {
+      await post(`/api/projects/${project.id}/team`, teamForm);
+      setEditingTeam(false);
+    });
+  };
   return (
     <div className="project-detail">
       <div className="detail-header">
@@ -1205,6 +1425,18 @@ function ProjectDetail({
           </p>
         </div>
         <div className="detail-actions">
+          <button
+            className="button small secondary"
+            disabled={!teamEditable || busy === 'team'}
+            title={
+              teamEditable
+                ? 'Edit the lead and worker accounts for future work'
+                : 'Team changes are available before approval or after pausing'
+            }
+            onClick={() => setEditingTeam(true)}
+          >
+            <Users size={14} /> Edit team
+          </button>
           {['running', 'paused'].includes(project.state) && (
             <button
               className="button small secondary"
@@ -1258,6 +1490,62 @@ function ProjectDetail({
             </span>
           )}
         </div>
+        {editingTeam && (
+          <div className="team-editor">
+            <div className="team-editor-heading">
+              <div>
+                <span className="eyebrow">TEAM ASSIGNMENT</span>
+                <strong>Choose who plans, reviews, and executes this project.</strong>
+              </div>
+              <button className="button small ghost" onClick={() => setEditingTeam(false)}>
+                Cancel
+              </button>
+            </div>
+            <label>
+              Lead and reviewer
+              <select
+                value={teamForm.lead}
+                onChange={(e) => setTeamForm({ ...teamForm, lead: e.target.value })}
+              >
+                {accounts.map((account) => (
+                  <option key={account.id} value={account.id}>
+                    {account.id}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <fieldset className="team-worker-picker">
+              <legend>Worker accounts</legend>
+              {accounts.map((account) => (
+                <label key={account.id} className="check-label">
+                  <input
+                    type="checkbox"
+                    checked={teamForm.workers.includes(account.id)}
+                    onChange={() => toggleTeamWorker(account.id)}
+                  />
+                  {account.id}
+                </label>
+              ))}
+            </fieldset>
+            <div className="team-editor-actions">
+              <small>
+                Changes apply to future work. A draft plan will need to be created again.
+              </small>
+              <button
+                className="button small primary"
+                disabled={!teamForm.lead || !teamForm.workers.length || busy === 'team'}
+                onClick={saveTeam}
+              >
+                {busy === 'team' ? (
+                  <LoaderCircle className="spin" size={14} />
+                ) : (
+                  <Check size={14} />
+                )}{' '}
+                Save team
+              </button>
+            </div>
+          </div>
+        )}
         {project.plan?.summary && <p className="plan-summary">{project.plan.summary}</p>}
         <textarea
           value={goal}
@@ -1267,7 +1555,8 @@ function ProjectDetail({
         <div className="goal-footer">
           <span>
             {project.lead ? `Lead: ${project.lead}` : 'No lead assigned'} · {project.maxConcurrency}{' '}
-            workers max · {project.network ? 'Network on' : 'Network off'}
+            workers max · {project.network ? 'Network on' : 'Network off'} ·{' '}
+            {project.approvalPolicy === 'never' ? 'Sandbox only' : 'Ask when more access is needed'}
           </span>
           <button
             className="button primary"
@@ -1305,7 +1594,7 @@ function ProjectDetail({
         {tasks.length ? (
           <div className="task-list">
             {tasks.map((task, i) => (
-              <TaskRow key={task.id || i} task={task} index={i} lead={project.lead} />
+              <TaskRow key={task.id || i} task={task} index={i} />
             ))}
           </div>
         ) : (
@@ -1350,13 +1639,12 @@ function ProjectDetail({
     </div>
   );
 }
-function TaskRow({ task, index, lead }: { task: Task; index: number; lead: string }) {
+function TaskRow({ task, index }: { task: Task; index: number }) {
   const workerEvidence = task.workerIdentityEvidence;
   const reviewerEvidence = task.reviewerIdentityEvidence;
-  const expectedAccount =
-    reviewerEvidence?.role === 'reviewer' ? lead : workerEvidence?.account || task.account;
-  const evidence = reviewerEvidence ?? workerEvidence;
-  const evidenceMismatch = evidence && evidence.account !== expectedAccount;
+  const evidenceMismatch = Boolean(
+    workerEvidence && task.account && workerEvidence.account !== task.account,
+  );
   return (
     <div className="task-row">
       <span

@@ -78,6 +78,15 @@ export async function createServer(engine: Engine, token: string, port = 7437) {
       return { ok: true };
     });
   }
+  app.get<{ Params: { id: string } }>('/api/accounts/:id/models', async (request) =>
+    engine.models(request.params.id),
+  );
+  app.post<{ Params: { id: string } }>('/api/accounts/:id/settings', async (request) => {
+    const body = z
+      .object({ model: z.string().min(1).max(100).nullable().optional() })
+      .parse(request.body);
+    return engine.updateAccountModel(request.params.id, body.model);
+  });
   app.post('/api/projects', async (request) => engine.createProject(request.body));
   app.post('/api/demo', async () => engine.demo());
   app.post<{ Params: { id: string } }>('/api/projects/:id/plan', async (request, reply) => {
@@ -104,6 +113,12 @@ export async function createServer(engine: Engine, token: string, port = 7437) {
   app.post<{ Params: { id: string } }>('/api/projects/:id/retry', async (request) =>
     engine.retry(request.params.id, z.object({ taskId: z.string() }).parse(request.body).taskId),
   );
+  app.post<{ Params: { id: string } }>('/api/projects/:id/team', async (request) => {
+    const body = z
+      .object({ lead: z.string().min(1), workers: z.array(z.string().min(1)).min(1) })
+      .parse(request.body);
+    return engine.updateTeam(request.params.id, body.lead, body.workers);
+  });
   app.get<{ Params: { id: string } }>('/api/projects/:id/results', async (request) =>
     engine.results(request.params.id),
   );

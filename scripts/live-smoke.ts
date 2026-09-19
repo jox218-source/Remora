@@ -10,6 +10,7 @@ const { values } = parseArgs({
     'confirm-usage': { type: 'boolean' },
     readiness: { type: 'boolean' },
     home: { type: 'string' },
+    'sandbox-only': { type: 'boolean' },
   },
 });
 if (!values.accounts || values.accounts.split(',').length !== 2)
@@ -82,22 +83,46 @@ if (!values.readiness) {
   );
   const project = await api('/projects', {
     root,
-    name: 'Live isolation smoke test',
+    name: 'Live two-account bounded pilot',
     lead: accounts[0],
     workers: accounts,
+    approvalPolicy: values['sandbox-only'] ? 'never' : 'on-request',
   });
   await api(`/projects/${project.id}/plan`, {
-    goal: 'Verify two accounts can independently write local artifacts and review them.',
+    goal: 'Verify two accounts can independently write local analyses, then have the lead combine them into one reviewed report.',
     plan: {
-      summary: 'Two independent local artifact tasks',
-      tasks: accounts.map((account, i) => ({
-        id: `worker-${i}`,
-        title: `Worker ${i}`,
-        instruction: `Create worker-${i}.txt containing exactly Remora live test ${i}. Do not run network commands.`,
-        account,
-        dependencies: [],
-        acceptance: [`worker-${i}.txt exists and contains exactly Remora live test ${i}.`],
-      })),
+      summary: 'Two independent analyses and one dependent combined report',
+      tasks: [
+        {
+          id: 'analysis-0',
+          title: 'Independent analysis 0',
+          instruction:
+            'Create analysis-0.txt with a short, self-contained analysis of the supplied brief. Label it as a live Remora pilot artifact. Do not run network commands.',
+          account: accounts[0],
+          dependencies: [],
+          acceptance: ['analysis-0.txt exists and contains a labeled analysis of the brief.'],
+        },
+        {
+          id: 'analysis-1',
+          title: 'Independent analysis 1',
+          instruction:
+            'Create analysis-1.txt with a separate short, self-contained analysis of the supplied brief. Label it as a live Remora pilot artifact. Do not run network commands.',
+          account: accounts[1],
+          dependencies: [],
+          acceptance: ['analysis-1.txt exists and contains a labeled analysis of the brief.'],
+        },
+        {
+          id: 'combined-report',
+          title: 'Combined report',
+          instruction:
+            'Read the accepted analysis-0.txt and analysis-1.txt dependency outputs, then create combined-report.txt that combines their useful points. Label it as a live Remora pilot artifact and do not modify either source analysis.',
+          account: accounts[0],
+          dependencies: ['analysis-0', 'analysis-1'],
+          acceptance: [
+            'combined-report.txt exists, is labeled, and reflects both dependency analyses.',
+          ],
+        },
+      ],
     },
   });
   await api(`/projects/${project.id}/approve`, {});
