@@ -1,0 +1,20 @@
+name: Provider or adapter report
+description: Report provider compatibility or adapter behavior
+title: 'provider: '
+labels: [provider]
+body:
+  - type: markdown
+    attributes:
+      value: 'Do not include credentials or private account data. Remora does not bypass provider limits.'
+  - type: input
+    id: provider
+    attributes:
+      label: Provider and installed app version
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Sanitized context, command, and output
+    validations:
+      required: true

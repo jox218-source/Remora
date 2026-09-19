@@ -1,0 +1,26 @@
+name: Bug report
+description: Report a reproducible problem
+title: 'bug: '
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: 'Please remove credentials, tokens, account exports, and private task data.'
+  - type: input
+    id: version
+    attributes:
+      label: Version and commit
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: OS and Node version
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps and sanitized output
+    validations:
+      required: true

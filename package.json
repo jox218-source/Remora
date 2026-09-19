@@ -1,0 +1,37 @@
+{
+  "name": "remora-workspace",
+  "version": "0.1.0-alpha.1",
+  "private": true,
+  "type": "module",
+  "description": "Local orchestration for multiple AI accounts",
+  "license": "Apache-2.0",
+  "repository": "github:jox218-source/Remora",
+  "engines": {
+    "node": ">=24.15.0 <25"
+  },
+  "workspaces": [
+    "packages/remora",
+    "apps/dashboard"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "typecheck": "npm run typecheck --workspaces && tsc -p tsconfig.check.json",
+    "lint": "eslint . && prettier --check .",
+    "format": "prettier --write .",
+    "test": "tsx --test tests/*.test.ts",
+    "check": "npm run typecheck && npm run lint && npm test && npm run build && node scripts/check-docs.mjs",
+    "remora": "node packages/remora/dist/cli.js",
+    "dev": "tsx packages/remora/src/cli.ts up",
+    "test:live": "tsx scripts/live-smoke.ts",
+    "test:protocol": "tsx scripts/protocol-smoke.ts"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.0",
+    "@types/node": "^24.0.0",
+    "eslint": "^9.39.0",
+    "prettier": "^3.9.8",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "typescript-eslint": "^8.46.0"
+  }
+}

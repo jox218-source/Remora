@@ -1,0 +1,21 @@
+{
+  "name": "@remora/core",
+  "version": "0.1.0-alpha.1",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "bin": {
+    "remora": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@fastify/static": "^10.1.4",
+    "commander": "^14.0.0",
+    "diff": "^9.0.0",
+    "fastify": "^5.12.5",
+    "zod": "^4.0.0"
+  }
+}

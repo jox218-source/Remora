@@ -1,0 +1,24 @@
+{
+  "summary": "Compare two approaches and write a cited recommendation.",
+  "tasks": [
+    {
+      "id": "research",
+      "title": "Gather comparison notes",
+      "instruction": "Collect concise, cited evidence for two implementation approaches. Label assumptions and unknowns.",
+      "account": "demo-two",
+      "dependencies": [],
+      "acceptance": ["Notes compare both approaches", "Sources and assumptions are labeled"]
+    },
+    {
+      "id": "report",
+      "title": "Write recommendation",
+      "instruction": "Write a short recommendation using the research notes and state risks and next steps.",
+      "account": "demo-one",
+      "dependencies": ["research"],
+      "acceptance": [
+        "Recommendation is supported by the notes",
+        "Risks and next steps are explicit"
+      ]
+    }
+  ]
+}
