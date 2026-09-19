@@ -95,6 +95,18 @@ export class RpcClient extends EventEmitter {
           if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
         }
       }
+      await new Promise<void>((resolve, reject) => {
+        if (this.child.exitCode !== null || this.child.signalCode !== null) return resolve();
+        const exited = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          this.child.off('exit', exited);
+          reject(new Error('Provider did not confirm process exit after termination'));
+        }, 5000);
+        this.child.once('exit', exited);
+      });
     }
     this.child.stdin.destroy();
     this.finish(new Error('Provider closed'));
