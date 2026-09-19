@@ -109,7 +109,20 @@ const api = async <T,>(url: string, init: RequestInit = {}): Promise<T> => {
   });
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(body || `${response.status} ${response.statusText}`);
+    let message = body || `${response.status} ${response.statusText}`;
+    try {
+      const parsed: unknown = JSON.parse(body);
+      if (
+        parsed &&
+        typeof parsed === 'object' &&
+        'error' in parsed &&
+        typeof parsed.error === 'string'
+      )
+        message = parsed.error;
+    } catch {
+      // Non-JSON errors can come from an intermediary or an unavailable runtime.
+    }
+    throw new Error(message);
   }
   return response.status === 204 ? (undefined as T) : response.json();
 };
@@ -682,8 +695,15 @@ function Accounts({
               value={form.id}
               onChange={(e) => setForm({ ...form, id: e.target.value })}
               placeholder="personal-codex"
+              pattern="[a-z0-9][a-z0-9_\-]{0,47}"
+              maxLength={48}
+              title="Use 1–48 lowercase letters, digits, underscores or hyphens; start with a letter or digit."
+              aria-describedby="account-id-help"
               required
             />
+            <span id="account-id-help" className="optional">
+              A nickname, not your email. Use lowercase letters, numbers, underscores or hyphens.
+            </span>
           </label>
           <label>
             Provider

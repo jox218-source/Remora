@@ -44,9 +44,15 @@ export async function createServer(engine: Engine, token: string, port = 7437) {
     }
   });
   app.setErrorHandler((error, _request, reply) => {
-    reply
-      .code(400)
-      .send({ error: redact(error instanceof Error ? error.message : 'Request failed') });
+    const message =
+      error instanceof z.ZodError
+        ? error.issues
+            .map((issue) => `${issue.path.join('.') || 'Input'}: ${issue.message}`)
+            .join('; ')
+        : error instanceof Error
+          ? error.message
+          : 'Request failed';
+    reply.code(400).send({ error: redact(message) });
   });
   app.post('/api/session', async (request, reply) => {
     const body = z.object({ token: z.string() }).parse(request.body);
