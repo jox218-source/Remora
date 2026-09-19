@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security issue
+    url: https://github.com/jox218-source/Remora/security/advisories/new
+    about: Report vulnerabilities privately when GitHub private reporting is available.

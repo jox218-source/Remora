@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.cache/
+coverage/
+.remora/
+.env
+.env.*
+!.env.example
+*.log
+*.sqlite*
+auth.json
+.DS_Store
