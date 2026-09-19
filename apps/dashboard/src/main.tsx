@@ -44,6 +44,9 @@ type Account = {
   model?: string;
   status: string;
   identity?: string;
+  authType?: string;
+  boundIdentity?: string;
+  observedIdentity?: string;
   usage?: AccountUsage | null;
   checkedAt?: string;
 };
@@ -58,6 +61,14 @@ type Task = {
   revision?: number;
   feedback?: string;
   result?: string;
+  session?: { account?: string; threadId?: string };
+  workerIdentityEvidence?: { account: string; identity?: string; checkedAt: string; role: string };
+  reviewerIdentityEvidence?: {
+    account: string;
+    identity?: string;
+    checkedAt: string;
+    role: string;
+  };
 };
 type Project = {
   id: string;
@@ -137,19 +148,21 @@ function App() {
     'overview',
   );
   const [selected, setSelected] = useState<string>();
-  const [error, setError] = useState('');
+  const [actionError, setActionError] = useState('');
+  const [connectionError, setConnectionError] = useState('');
   const [busy, setBusy] = useState('');
   const [mobileNav, setMobileNav] = useState(false);
   const [runtimeConnected, setRuntimeConnected] = useState(false);
-  const refresh = async () => {
+  const refresh = async (clearError = true) => {
     try {
       setState(await api<State>('/api/state'));
       setRuntimeConnected(true);
-      setError('');
+      setConnectionError('');
+      if (clearError) setActionError('');
       return true;
     } catch (e) {
       setRuntimeConnected(false);
-      setError(e instanceof Error ? e.message : 'Unable to load Remora state');
+      setConnectionError(e instanceof Error ? e.message : 'Unable to load Remora state');
       return false;
     }
   };
@@ -161,7 +174,7 @@ function App() {
         const loaded = !cancelled && (await refresh());
         if (token && loaded) history.replaceState(null, '', location.pathname + location.search);
       } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : 'Session setup failed');
+        if (!cancelled) setConnectionError(e instanceof Error ? e.message : 'Session setup failed');
       }
     };
     const readHashToken = () =>
@@ -172,7 +185,7 @@ function App() {
     };
     let timer: number | undefined;
     void initialize(readHashToken()).then(() => {
-      if (!cancelled) timer = window.setInterval(refresh, 2000);
+      if (!cancelled) timer = window.setInterval(() => void refresh(false), 2000);
     });
     window.addEventListener('hashchange', onHashChange);
     return () => {
@@ -186,9 +199,9 @@ function App() {
     setBusy(key);
     try {
       await action();
-      await refresh();
+      await refresh(true);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Request failed');
+      setActionError(e instanceof Error ? e.message : 'Request failed');
     } finally {
       setBusy('');
     }
@@ -275,17 +288,36 @@ function App() {
             </span>
           </div>
         </header>
-        {error && (
+        {(actionError || connectionError) && (
           <div className="error-banner">
             <AlertCircle size={18} />
-            <span>{error}</span>
-            <button onClick={() => setError('')}>
+            <span>
+              {!runtimeConnected && connectionError && (
+                <strong>Dashboard session required. </strong>
+              )}
+              {actionError || connectionError}
+              {!runtimeConnected && connectionError && (
+                <>
+                  {' '}
+                  Reopen the dashboard URL printed by <code>remora up</code> so this tab can
+                  reconnect.
+                </>
+              )}
+            </span>
+            <button
+              onClick={() => {
+                setActionError('');
+                setConnectionError('');
+              }}
+            >
               <X size={16} />
             </button>
           </div>
         )}
         <div className="content">
-          {state.approvals.length > 0 && <ApprovalBar approvals={state.approvals} act={act} />}{' '}
+          {state.approvals.length > 0 && (
+            <ApprovalBar approvals={state.approvals} projects={state.projects} act={act} />
+          )}{' '}
           {view === 'overview' && (
             <Overview
               state={state}
@@ -299,7 +331,15 @@ function App() {
               }
             />
           )}
-          {view === 'accounts' && <Accounts accounts={state.accounts} act={act} busy={busy} />}{' '}
+          {view === 'accounts' && (
+            <Accounts
+              accounts={state.accounts}
+              projects={state.projects}
+              events={state.events}
+              act={act}
+              busy={busy}
+            />
+          )}{' '}
           {view === 'projects' && (
             <Projects
               state={state}
@@ -485,13 +525,34 @@ function EventRow({ event }: { event: Event }) {
     </div>
   );
 }
+function approvalScope(details: unknown) {
+  if (!details || typeof details !== 'object') return 'Requested scope is available below.';
+  const value = details as Record<string, unknown>;
+  const command = typeof value.command === 'string' ? value.command : undefined;
+  const cwd = typeof value.cwd === 'string' ? value.cwd : undefined;
+  const grantRoot = typeof value.grantRoot === 'string' ? value.grantRoot : undefined;
+  if (command)
+    return `Command: ${command.slice(0, 240)}${command.length > 240 ? '…' : ''}${cwd ? ` · cwd: ${cwd}` : ''}`;
+  if (grantRoot) return `Requested file access root: ${grantRoot}`;
+  if (typeof value.reason === 'string') return `Reason: ${value.reason}`;
+  return 'Requested scope is available below.';
+}
 function ApprovalBar({
   approvals,
+  projects,
   act,
 }: {
   approvals: Approval[];
+  projects: Project[];
   act: (k: string, fn: () => Promise<unknown>) => Promise<void>;
 }) {
+  const canAcceptForSession = (approval: Approval) => {
+    const decisions =
+      approval.details && typeof approval.details === 'object'
+        ? (approval.details as { availableDecisions?: unknown }).availableDecisions
+        : undefined;
+    return !Array.isArray(decisions) || decisions.includes('acceptForSession');
+  };
   return (
     <section className="approval-bar">
       <div className="approval-heading">
@@ -504,14 +565,36 @@ function ApprovalBar({
       {approvals.map((approval) => (
         <div className="approval-item" key={approval.id}>
           <div>
-            <strong>{approval.method}</strong>
             <small>
-              {approval.account}
-              {approval.taskId ? ` · task ${approval.taskId}` : ''} ·{' '}
-              {typeof approval.details === 'string'
-                ? approval.details
-                : JSON.stringify(approval.details)}
+              Project:{' '}
+              {projects.find((project) => project.id === approval.projectId)?.name ?? 'Unknown'}
+              {' · '}
+              {approval.projectId}
             </small>
+            <strong>
+              {approval.method.includes('commandExecution')
+                ? 'Run a provider command'
+                : approval.method.includes('fileChange')
+                  ? 'Change a provider file'
+                  : 'Provider action needs approval'}
+            </strong>
+            <small>
+              Account {approval.account}
+              {approval.taskId ? ` · ${approval.taskId}` : ''} · provider task session
+            </small>
+            <small>
+              Why: the provider requested permission to continue. Review the requested command,
+              path, and permissions below.
+            </small>
+            <small>{approvalScope(approval.details)}</small>
+            <details>
+              <summary>Technical details</summary>
+              <pre>
+                {typeof approval.details === 'string'
+                  ? approval.details
+                  : JSON.stringify(approval.details, null, 2)}
+              </pre>
+            </details>
           </div>
           <div className="approval-actions">
             <button
@@ -536,6 +619,21 @@ function ApprovalBar({
             >
               <Check size={14} /> Allow once
             </button>
+            {canAcceptForSession(approval) && (
+              <button
+                className="button small primary"
+                title="Allow matching requests for this provider task session only"
+                onClick={() =>
+                  act(`session-${approval.id}`, () =>
+                    post(`/api/approvals/${encodeURIComponent(approval.id)}`, {
+                      decision: 'acceptForSession',
+                    }),
+                  )
+                }
+              >
+                <ShieldCheck size={14} /> Allow for this task
+              </button>
+            )}
           </div>
         </div>
       ))}
@@ -546,30 +644,50 @@ function usageText(usage?: AccountUsage | null) {
   if (!usage) return 'Usage unavailable';
   const source = usage.rateLimitsByLimitId || usage.rateLimits;
   if (!source) return 'Usage unavailable';
-  const windows: UsageWindow[] = Array.isArray(source) ? source : Object.values(source);
-  const window = windows.find((w) => typeof w?.usedPercent === 'number') || windows[0];
-  if (!window) return 'Usage unavailable';
-  const percent =
-    typeof window.usedPercent === 'number'
-      ? `${Math.round(window.usedPercent)}% used`
-      : 'Usage unavailable';
-  const reset =
-    typeof window.resetsAt === 'number'
-      ? ` · resets ${new Date(window.resetsAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
-      : '';
-  return `${percent}${reset}`;
+  const windows: Array<{ label: string; value: UsageWindow }> = [];
+  const add = (label: string, value: unknown) => {
+    if (value && typeof value === 'object') windows.push({ label, value: value as UsageWindow });
+  };
+  if (Array.isArray(source)) source.forEach((value, i) => add(`window ${i + 1}`, value));
+  else
+    Object.entries(source).forEach(([label, value]) => {
+      if (value && typeof value === 'object' && ('primary' in value || 'secondary' in value))
+        Object.entries(value).forEach(([nestedLabel, nestedValue]) =>
+          add(nestedLabel, nestedValue),
+        );
+      else add(label, value);
+    });
+  const rendered = windows.flatMap(({ label, value }) => {
+    if (typeof value.usedPercent !== 'number') return [];
+    const remaining = Math.max(0, Math.min(100, 100 - value.usedPercent));
+    const reset =
+      typeof value.resetsAt === 'number'
+        ? ` · resets ${new Date(value.resetsAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+        : '';
+    return `${label}: ${Math.round(remaining)}% remaining${reset}`;
+  });
+  return rendered.length ? rendered.join(' · ') : 'Usage unavailable';
 }
 
 function Accounts({
   accounts,
+  projects,
+  events,
   act,
   busy,
 }: {
   accounts: Account[];
+  projects: Project[];
+  events: Event[];
   act: (k: string, fn: () => Promise<unknown>) => Promise<void>;
   busy: string;
 }) {
   const [form, setForm] = useState({ id: '', provider: 'codex', model: '' });
+  const identityCounts = new Map<string, number>();
+  accounts.forEach((account) => {
+    if (account.identity)
+      identityCounts.set(account.identity, (identityCounts.get(account.identity) ?? 0) + 1);
+  });
   const [login, setLogin] = useState<{
     id: string;
     authUrl?: string;
@@ -611,7 +729,7 @@ function Accounts({
               <div>
                 <h3>{a.id}</h3>
                 <small>
-                  {a.identity || label(a.provider)}
+                  {a.identity || 'Identity unknown'}
                   {a.model ? ` · ${a.model}` : ''}
                 </small>
               </div>
@@ -633,6 +751,65 @@ function Accounts({
                   : 'Not checked'}
               </span>
               <span>{usageText(a.usage)}</span>
+            </div>
+            {a.identity && identityCounts.get(a.identity)! > 1 && (
+              <div className="account-warning">
+                <AlertCircle size={13} /> Duplicate provider identity detected; do not run an
+                independent-account pilot until aliases resolve to different identities.
+              </div>
+            )}
+            {a.status === 'identity-mismatch' && (
+              <div className="account-warning">
+                <AlertCircle size={13} /> Provider identity changed from{' '}
+                {a.boundIdentity ?? a.identity}
+                to {a.observedIdentity ?? 'unknown'}; rebind explicitly before running.
+              </div>
+            )}
+            <div className="account-activity">
+              {projects
+                .filter((project) => project.state === 'planning' && project.lead === a.id)
+                .map((project) => (
+                  <span key={`${project.id}-planning`}>Planning · {project.name}</span>
+                ))}
+              {projects
+                .flatMap((project) =>
+                  project.tasks
+                    .filter(
+                      (task) =>
+                        (task.status === 'running' && task.account === a.id) ||
+                        (task.status === 'reviewing' && project.lead === a.id) ||
+                        (task.status === 'review' && project.lead === a.id),
+                    )
+                    .map((task) => ({ project, task })),
+                )
+                .slice(0, 2)
+                .map(({ project, task }) => (
+                  <span key={`${project.id}-${task.id}`}>
+                    {task.status === 'reviewing'
+                      ? 'Reviewing'
+                      : task.status === 'review'
+                        ? 'Queued for review'
+                        : 'Working on'}{' '}
+                    <strong>{task.title}</strong> · {project.name}
+                  </span>
+                ))}
+              {!projects.some(
+                (project) =>
+                  (project.state === 'planning' && project.lead === a.id) ||
+                  project.tasks.some(
+                    (task) =>
+                      (task.status === 'running' && task.account === a.id) ||
+                      (['reviewing', 'review'].includes(task.status || '') &&
+                        project.lead === a.id),
+                  ),
+              ) && <span>Idle · no active task</span>}
+              {events
+                .filter((event) => event.account === a.id && event.type === 'provider')
+                .sort((left, right) => (left.id ?? 0) - (right.id ?? 0))
+                .slice(-1)
+                .map((event) => (
+                  <span key={event.id}>Last action: {event.message}</span>
+                ))}
             </div>
             <div className="card-actions">
               <button
@@ -915,7 +1092,7 @@ function Projects({
                 />
               </label>
               <label>
-                Lead account
+                Lead and reviewer account
                 <select
                   value={form.lead}
                   onChange={(e) => setForm({ ...form, lead: e.target.value })}
@@ -930,7 +1107,8 @@ function Projects({
                 </select>
               </label>
               <fieldset className="worker-picker">
-                <legend>Worker accounts</legend>
+                <legend>Worker accounts · grunt work</legend>
+                <small>Choose one or more accounts for independent task execution.</small>
                 {state.accounts.map((a) => (
                   <label key={a.id} className="check-label">
                     <input
@@ -943,6 +1121,12 @@ function Projects({
                 ))}
                 {!state.accounts.length && <small>No accounts connected.</small>}
               </fieldset>
+              <p className="assignment-summary">
+                Lead/reviewer: <strong>{form.lead || 'Choose an account'}</strong> · Workers:{' '}
+                <strong>
+                  {form.workers.length ? form.workers.join(', ') : 'Choose at least one'}
+                </strong>
+              </p>
               <div className="form-row">
                 <label>
                   Max concurrency
@@ -1121,7 +1305,7 @@ function ProjectDetail({
         {tasks.length ? (
           <div className="task-list">
             {tasks.map((task, i) => (
-              <TaskRow key={task.id || i} task={task} index={i} />
+              <TaskRow key={task.id || i} task={task} index={i} lead={project.lead} />
             ))}
           </div>
         ) : (
@@ -1166,7 +1350,13 @@ function ProjectDetail({
     </div>
   );
 }
-function TaskRow({ task, index }: { task: Task; index: number }) {
+function TaskRow({ task, index, lead }: { task: Task; index: number; lead: string }) {
+  const workerEvidence = task.workerIdentityEvidence;
+  const reviewerEvidence = task.reviewerIdentityEvidence;
+  const expectedAccount =
+    reviewerEvidence?.role === 'reviewer' ? lead : workerEvidence?.account || task.account;
+  const evidence = reviewerEvidence ?? workerEvidence;
+  const evidenceMismatch = evidence && evidence.account !== expectedAccount;
   return (
     <div className="task-row">
       <span
@@ -1190,6 +1380,18 @@ function TaskRow({ task, index }: { task: Task; index: number }) {
               {task.account}
             </span>
           )}
+          {workerEvidence && (
+            <span>
+              <ShieldCheck size={12} /> Worker identity: {workerEvidence.identity ?? 'unknown'}
+            </span>
+          )}
+          {reviewerEvidence && (
+            <span>
+              <ShieldCheck size={12} /> Reviewer identity: {reviewerEvidence.identity ?? 'unknown'}
+            </span>
+          )}
+          {!workerEvidence && !reviewerEvidence && <span>Provider identity: unknown</span>}
+          {evidenceMismatch && <span className="account-warning">Runtime account mismatch</span>}
           {task.dependencies?.length ? (
             <span>
               <Link2 size={12} />

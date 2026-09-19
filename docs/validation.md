@@ -16,13 +16,21 @@ The [Windows and Ubuntu CI run](https://github.com/jox218-source/Remora/actions/
 
 This does not constitute authenticated multi-account or live billing validation. Real-account isolation on Windows and Linux is unverified until opt-in live validation; quota exhaustion and logout/refresh isolation with real accounts remain release gates.
 
-For live validation, use two already connected aliases and explicitly confirm usage:
+Before using any model turns, verify the two aliases and their connection state with the read-only readiness check. It refreshes provider account metadata, does not create a project, and does not print provider identities or credentials:
+
+```bash
+npm run test:live -- --accounts first,second --readiness
+```
+
+Once readiness reports two connected Codex profiles, run the small two-worker pilot with explicit usage confirmation:
 
 ```bash
 npm run test:live -- --accounts first,second --confirm-usage
 ```
 
-The service must already be running. The smoke test does not log out, merge, or accept artifacts automatically. Inspect its results in the dashboard.
+The service must already be running. The smoke test does not log out, merge, or accept artifacts automatically. Inspect its results in the dashboard. If the command is interrupted with Ctrl+C or a termination signal, it requests cancellation and leaves the task workspaces available for inspection.
+
+Provider command and file-change prompts are shown in plain language with the requested command, working path, and any requested permission root. `Allow once` approves only the current request; `Allow for this task` uses the installed app-server's `acceptForSession` decision and applies only to the current provider task session. Remora does not auto-approve requests; inspect any requested path or additional permission before allowing it.
 
 ## Workspace boundaries
 

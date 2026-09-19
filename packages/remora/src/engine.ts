@@ -24,7 +24,9 @@ export class Engine {
   readonly providers: Record<string, Provider>;
   readonly approvals = new Map<
     string,
-    Approval & { resolve(decision: 'accept' | 'decline'): void }
+    Approval & {
+      resolve(decision: 'accept' | 'acceptForSession' | 'decline'): void;
+    }
   >();
   private active = new Map<
     string,
@@ -33,10 +35,12 @@ export class Engine {
   private ticking = false;
   private closing = false;
   private authBusy = new Set<string>();
+  private statusBusy = new Set<string>();
   private loginPending = new Set<string>();
   private epochs = new Map<string, number>();
   private recovering = false;
   private timer: NodeJS.Timeout;
+  private nextAccountRefresh = 0;
   constructor(
     readonly store: Store,
     providers?: Record<string, Provider>,
@@ -58,6 +62,10 @@ export class Engine {
     };
     this.timer = setInterval(() => {
       void this.tick();
+      if (Date.now() >= this.nextAccountRefresh) {
+        this.nextAccountRefresh = Date.now() + 30_000;
+        void this.refreshAccounts();
+      }
     }, 250);
     this.timer.unref();
   }
@@ -103,21 +111,53 @@ export class Engine {
   }
   async refreshAccount(id: string) {
     const account = this.account(id);
-    if (this.authBusy.has(id) || this.loginPending.has(id) || account.status === 'quarantined')
+    if (
+      this.authBusy.has(id) ||
+      this.loginPending.has(id) ||
+      this.statusBusy.has(id) ||
+      account.status === 'quarantined'
+    )
       return account;
+    this.statusBusy.add(id);
     const epoch = this.epochs.get(id) ?? 0;
     try {
-      Object.assign(account, await this.providers[account.provider].status(account));
+      const observed = await this.providers[account.provider].status(account);
+      const bound = account.boundIdentity ?? account.identity;
+      if (bound && observed.identity && bound.toLowerCase() !== observed.identity.toLowerCase()) {
+        account.status = 'identity-mismatch';
+        account.observedIdentity = observed.identity;
+        account.usage = observed.usage;
+        account.checkedAt = observed.checkedAt;
+        this.store.log('account', `Identity mismatch for ${id}; explicit rebind required`);
+      } else {
+        Object.assign(account, observed);
+        if (observed.identity && !account.boundIdentity) {
+          account.boundIdentity = observed.identity;
+          account.identity = observed.identity;
+        }
+      }
+      const current = this.store.list<Account>('accounts').find((a) => a.id === id);
+      if (!current || epoch !== (this.epochs.get(id) ?? 0) || current.status === 'quarantined')
+        return current ?? { ...account, status: 'removed' };
+      this.store.put('accounts', account);
+      return account;
     } catch (error) {
+      const current = this.store.list<Account>('accounts').find((a) => a.id === id);
+      if (!current || epoch !== (this.epochs.get(id) ?? 0) || current.status === 'quarantined')
+        return current ?? { ...account, status: 'removed' };
       account.status = 'unavailable';
-      account.checkedAt = new Date().toISOString();
+      account.usage = null;
       this.store.log('account', error instanceof Error ? error.message : 'Account unavailable');
+      this.store.put('accounts', account);
+      return account;
+    } finally {
+      this.statusBusy.delete(id);
     }
-    const current = this.store.list<Account>('accounts').find((a) => a.id === id);
-    if (!current || epoch !== (this.epochs.get(id) ?? 0))
-      return current ?? { ...account, status: 'removed' };
-    this.store.put('accounts', account);
-    return account;
+  }
+  private async refreshAccounts() {
+    await Promise.allSettled(
+      this.store.list<Account>('accounts').map((account) => this.refreshAccount(account.id)),
+    );
   }
   async login(id: string) {
     if (this.busyAccount(id)) throw new Error('Account is busy');
@@ -235,6 +275,7 @@ export class Engine {
           cwd: this.workspaces.directory(project, 'input'),
           readOnly: true,
           signal,
+          role: 'planner',
           prompt: `Plan this project. Do not execute tasks. Use only the eligible account aliases. Return JSON matching the schema. Tasks must have explicit acceptance criteria and an acyclic dependency graph. Keep tasks small and avoid simultaneous edits to the same file.\nGOAL: ${goal}\nELIGIBLE_ACCOUNTS=${JSON.stringify(project.workers)}\nTasks may include research, writing, or coding. Each task runs in a separate workspace.`,
           schema: z.toJSONSchema(planSchema),
           onSession: (ref) => {
@@ -360,7 +401,7 @@ export class Engine {
     project: Project,
     accountId: string,
     options: Pick<RunRequest, 'cwd' | 'prompt' | 'readOnly' | 'signal' | 'onSession'> &
-      Partial<RunRequest>,
+      Partial<RunRequest> & { role: 'planner' | 'worker' | 'reviewer' },
   ) {
     const account = this.account(accountId);
     return this.providers[account.provider]
@@ -369,7 +410,20 @@ export class Engine {
         projectId: project.id,
         account,
         network: project.network,
-        onEvent: (message) => this.store.log('provider', message, project.id, options.taskId),
+        onEvent: (message) =>
+          this.store.log('provider', message, project.id, options.taskId, accountId),
+        onIdentity: (identity, checkedAt) => {
+          const current = this.project(project.id);
+          const evidence = { account: accountId, identity, checkedAt, role: options.role };
+          if (options.taskId) {
+            const task = current.tasks.find((item) => item.id === options.taskId);
+            if (task) {
+              if (options.role === 'reviewer') task.reviewerIdentityEvidence = evidence;
+              else task.workerIdentityEvidence = evidence;
+            }
+          } else current.planningIdentityEvidence = evidence;
+          this.save(current);
+        },
       })
       .catch((error) => {
         if (error instanceof Error && error.message.includes('Unconfirmed provider shutdown')) {
@@ -479,6 +533,7 @@ export class Engine {
         prompt,
         readOnly: review,
         signal,
+        role: review ? 'reviewer' : 'worker',
         taskId,
         ...(review ? { schema: z.toJSONSchema(reviewSchema) } : {}),
         onSession: (ref) => {
@@ -535,11 +590,11 @@ export class Engine {
     run: RunRequest,
     method: string,
     details: unknown,
-  ): Promise<'accept' | 'decline'> {
+  ): Promise<'accept' | 'acceptForSession' | 'decline'> {
     return new Promise((resolve) => {
       const id = randomUUID();
       const abort = () => finish('decline');
-      const finish = (decision: 'accept' | 'decline') => {
+      const finish = (decision: 'accept' | 'acceptForSession' | 'decline') => {
         this.approvals.delete(id);
         run.signal.removeEventListener('abort', abort);
         resolve(decision);
@@ -564,13 +619,20 @@ export class Engine {
       );
     });
   }
-  decide(id: string, decision: 'accept' | 'decline') {
+  decide(id: string, decision: 'accept' | 'acceptForSession' | 'decline') {
     const approval = this.approvals.get(id);
     if (!approval) throw new Error('Approval is no longer pending');
+    const available = (approval.details as { availableDecisions?: unknown }).availableDecisions;
+    if (
+      decision === 'acceptForSession' &&
+      Array.isArray(available) &&
+      !available.includes(decision)
+    )
+      throw new Error('The provider did not offer session approval for this request');
     approval.resolve(decision);
     this.store.log(
       'permission',
-      `User ${decision === 'accept' ? 'approved' : 'declined'} one provider request`,
+      `User ${decision === 'decline' ? 'declined' : decision === 'acceptForSession' ? 'approved provider requests for this task session' : 'approved one provider request'}`,
       approval.projectId,
       approval.taskId,
     );

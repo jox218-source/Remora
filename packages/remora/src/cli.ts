@@ -224,7 +224,7 @@ program.command('status [projectId]').action(async (id) => {
 });
 program
   .command('permission <approvalId>')
-  .requiredOption('--decision <decision>', 'accept or decline (one request)')
+  .requiredOption('--decision <decision>', 'accept, acceptForSession, or decline')
   .action(async (id, options) =>
     output(await api(`/approvals/${id}`, { decision: options.decision })),
   );

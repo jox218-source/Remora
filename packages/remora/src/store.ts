@@ -26,6 +26,11 @@ export class Store {
       CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL, projectId TEXT, type TEXT NOT NULL, message TEXT NOT NULL, taskId TEXT);
       INSERT OR IGNORE INTO meta VALUES ('schema_version','1');`);
+    try {
+      this.db.exec('ALTER TABLE events ADD COLUMN account TEXT');
+    } catch {
+      // Existing databases already have the account column.
+    }
   }
   list<T>(table: 'accounts' | 'projects'): T[] {
     return this.db
@@ -48,12 +53,14 @@ export class Store {
   removeAccount(id: string) {
     this.db.prepare('DELETE FROM accounts WHERE id=?').run(id);
   }
-  log(type: string, message: string, projectId?: string, taskId?: string) {
+  log(type: string, message: string, projectId?: string, taskId?: string, account?: string) {
     const time = new Date().toISOString();
     const safe = redact(message).slice(0, 12000);
     const result = this.db
-      .prepare('INSERT INTO events(time,projectId,type,message,taskId) VALUES (?,?,?,?,?)')
-      .run(time, projectId ?? null, type, safe, taskId ?? null);
+      .prepare(
+        'INSERT INTO events(time,projectId,type,message,taskId,account) VALUES (?,?,?,?,?,?)',
+      )
+      .run(time, projectId ?? null, type, safe, taskId ?? null, account ?? null);
     const event = {
       id: Number(result.lastInsertRowid),
       time,
@@ -61,6 +68,7 @@ export class Store {
       type,
       message: safe,
       taskId,
+      account,
     };
     this.events.emit('event', event);
     return event;

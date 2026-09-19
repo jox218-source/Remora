@@ -123,7 +123,11 @@ export async function createServer(engine: Engine, token: string, port = 7437) {
     },
   );
   app.post<{ Params: { id: string } }>('/api/approvals/:id', async (request) => {
-    const body = z.object({ decision: z.enum(['accept', 'decline']) }).parse(request.body);
+    const body = z
+      .object({
+        decision: z.enum(['accept', 'acceptForSession', 'decline']),
+      })
+      .parse(request.body);
     engine.decide(request.params.id, body.decision);
     return { ok: true };
   });

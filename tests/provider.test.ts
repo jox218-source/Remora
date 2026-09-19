@@ -10,11 +10,12 @@ import type { RunRequest } from '../packages/remora/src/types.js';
 test('Codex adapter isolates profiles, streams results, routes permissions, reconciles and cancels', async () => {
   const home = mkdtempSync(join(tmpdir(), 'remora-protocol-'));
   let approvals = 0;
+  let approvalDecision: 'accept' | 'acceptForSession' = 'accept';
   const provider = new CodexProvider(
     home,
     async () => {
       approvals++;
-      return 'accept';
+      return approvalDecision;
     },
     () => {},
     process.execPath,
@@ -41,9 +42,17 @@ test('Codex adapter isolates profiles, streams results, routes permissions, reco
     );
     const result = await provider.run(run);
     assert.equal(result, 'Simulated protocol response');
+    await assert.rejects(
+      () => provider.run({ ...run, account: { ...one, identity: 'other@example.invalid' } }),
+      /identity changed/,
+    );
     const permission = await provider.run({ ...run, prompt: 'APPROVAL' });
     assert.equal(permission, 'accept');
     assert.equal(approvals, 1);
+    approvalDecision = 'acceptForSession';
+    const sessionPermission = await provider.run({ ...run, prompt: 'APPROVAL' });
+    assert.equal(sessionPermission, 'acceptForSession');
+    assert.equal(approvals, 2);
     const recovered = await provider.reconcile({
       account: 'one',
       threadId: 'thread-1',
@@ -63,6 +72,11 @@ test('Codex adapter isolates profiles, streams results, routes permissions, reco
     controller.abort();
     await rejection;
     assert.equal((await provider.status(one)).identity, 'one@example.invalid');
+    provider.status = async () => ({ status: 'connected', authType: 'apiKey' });
+    await assert.rejects(
+      () => provider.run({ ...run, account: { ...one, boundIdentity: 'one@example.invalid' } }),
+      /identity changed/,
+    );
   } finally {
     await provider.close();
     rmSync(home, { recursive: true, force: true });

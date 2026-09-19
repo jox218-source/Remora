@@ -580,6 +580,27 @@ nav {
 .account-meta .status-dot {
   margin-right: 4px;
 }
+.account-activity {
+  display: grid;
+  gap: 4px;
+  min-height: 28px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+.account-activity strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+.account-warning {
+  display: flex;
+  gap: 5px;
+  align-items: flex-start;
+  color: #9a542d;
+  font-size: 10px;
+  line-height: 1.35;
+  margin: 6px 0;
+}
 .card-actions {
   display: flex;
   gap: 5px;
@@ -601,6 +622,15 @@ nav {
   color: var(--muted);
   font-size: 12px;
   margin: 0;
+}
+.assignment-summary {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 11px;
+  margin: 0;
+}
+.assignment-summary strong {
+  color: var(--ink);
 }
 .add-account form {
   display: flex;

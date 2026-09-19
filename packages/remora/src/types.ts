@@ -31,6 +31,9 @@ export type Account = {
   model?: string;
   status: string;
   identity?: string;
+  authType?: string;
+  boundIdentity?: string;
+  observedIdentity?: string;
   usage?: unknown;
   checkedAt?: string;
 };
@@ -52,8 +55,16 @@ export type Task = TaskSpec & {
   result?: string;
   feedback?: string;
   session?: SessionRef;
+  workerIdentityEvidence?: IdentityEvidence;
+  reviewerIdentityEvidence?: IdentityEvidence;
 };
 export type SessionRef = { account: string; threadId: string; turnId?: string };
+export type IdentityEvidence = {
+  account: string;
+  identity?: string;
+  checkedAt: string;
+  role: 'planner' | 'worker' | 'reviewer';
+};
 export type Project = {
   id: string;
   name: string;
@@ -85,6 +96,7 @@ export type Project = {
   integrationBranch?: string;
   acceptedAt?: string;
   planningSession?: SessionRef;
+  planningIdentityEvidence?: IdentityEvidence;
 };
 export type Event = {
   id: number;
@@ -93,6 +105,7 @@ export type Event = {
   type: string;
   message: string;
   taskId?: string;
+  account?: string;
 };
 export type Approval = {
   id: string;
@@ -115,6 +128,7 @@ export interface RunRequest {
   signal: AbortSignal;
   onSession(ref: SessionRef): void;
   onEvent(message: string): void;
+  onIdentity?(identity: string | undefined, checkedAt: string): void;
 }
 export interface Provider {
   readonly capabilities: { version: 1; sessions: boolean; usage: boolean; approvals: boolean };

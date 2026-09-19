@@ -329,6 +329,44 @@ test('event logs redact common token and credential formats', () => {
   );
 });
 
+test('provider events retain the account that performed the action', async () => {
+  const f = fixture();
+  try {
+    f.store.log('provider', 'Completed commandExecution', f.project.id, 'first', 'two');
+    assert.equal(f.store.logs(f.project.id).at(-1)?.account, 'two');
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('session approval is rejected when the provider did not advertise it', async () => {
+  const f = fixture();
+  try {
+    const pending = f.engine.requestApproval(
+      {
+        projectId: f.project.id,
+        account: f.engine.account('one'),
+        cwd: f.root,
+        prompt: 'test',
+        readOnly: true,
+        network: false,
+        signal: new AbortController().signal,
+        onSession() {},
+        onEvent() {},
+      },
+      'item/commandExecution/requestApproval',
+      { availableDecisions: ['accept', 'decline'] },
+    );
+    const approval = f.engine.snapshot().approvals[0];
+    assert.ok(approval);
+    assert.throws(() => f.engine.decide(approval.id, 'acceptForSession'), /did not offer/);
+    f.engine.decide(approval.id, 'decline');
+    await assert.doesNotReject(pending);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test('Windows account aliases cannot collide or use reserved device names', async () => {
   const f = fixture();
   try {
@@ -398,6 +436,54 @@ test('late account refresh cannot resurrect a removed account', async () => {
     await f.engine.removeAccount('unused');
     await refresh;
     assert.throws(() => f.engine.account('unused'), /not found/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('concurrent account refreshes share one bounded provider status call', async () => {
+  class CountStatus extends DemoProvider {
+    calls = 0;
+    override async status(account: any) {
+      this.calls++;
+      await setTimeout(50);
+      return super.status(account);
+    }
+  }
+  const provider = new CountStatus();
+  const f = fixture(provider);
+  try {
+    await Promise.all([f.engine.refreshAccount('one'), f.engine.refreshAccount('one')]);
+    assert.equal(provider.calls, 1);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('failed deferred refresh cannot resurrect removal or overwrite quarantine', async () => {
+  class FailingStatus extends DemoProvider {
+    override async status(_account: any): Promise<never> {
+      await setTimeout(50);
+      throw new Error('provider unavailable');
+    }
+  }
+  const f = fixture(new FailingStatus());
+  try {
+    f.engine.addAccount({ id: 'refresh-remove', provider: 'demo' });
+    const removed = f.engine.refreshAccount('refresh-remove');
+    await setTimeout(5);
+    await f.engine.removeAccount('refresh-remove');
+    await removed;
+    assert.throws(() => f.engine.account('refresh-remove'), /not found/);
+
+    f.engine.addAccount({ id: 'refresh-quarantine', provider: 'demo' });
+    const quarantined = f.engine.refreshAccount('refresh-quarantine');
+    await setTimeout(5);
+    const account = f.engine.account('refresh-quarantine');
+    account.status = 'quarantined';
+    f.store.put('accounts', account);
+    await quarantined;
+    assert.equal(f.engine.account('refresh-quarantine').status, 'quarantined');
   } finally {
     await f.cleanup();
   }
