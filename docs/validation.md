@@ -12,9 +12,9 @@ The protocol smoke test also passed with the installed `codex-cli 0.154.0-alpha.
 npm run test:protocol
 ```
 
-The [Windows and Ubuntu CI run](https://github.com/jox218-source/Remora/actions/runs/35457562948) passed on the validated head: Ubuntu passed all 36 tests; Windows passed 34 with two platform-specific skips. The full check includes type checking, lint, formatting, production builds, and Markdown links. Browser QA exercised demo creation, planning, approval, parallel workers, review, text/diff previews, and acceptance into its original test directory.
+The [Windows and Ubuntu CI run](https://github.com/jox218-source/Remora/actions/runs/35460025772) passed on the validated head: Ubuntu passed all 36 tests; Windows passed 34 with two platform-specific skips. The full check includes type checking, lint, formatting, production builds, and Markdown links. Browser QA exercised demo creation, planning, approval, parallel workers, review, text/diff previews, and acceptance into its original test directory.
 
-This does not constitute authenticated multi-account or live billing validation. Real-account isolation on Windows and Linux is unverified until opt-in live validation; quota exhaustion and logout/refresh isolation with real accounts remain release gates.
+This does not constitute general authenticated multi-account or live billing validation. The opt-in Windows pilot demonstrated isolation for its two connected aliases; Linux live isolation, quota exhaustion, and logout/refresh isolation with real accounts remain release gates.
 
 Before using any model turns, verify the two aliases and their connection state with the read-only readiness check. It refreshes provider account metadata, does not create a project, and does not print provider identities or credentials:
 
