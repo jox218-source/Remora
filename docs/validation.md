@@ -12,7 +12,9 @@ The protocol smoke test also passed with the installed `codex-cli 0.154.0-alpha.
 npm run test:protocol
 ```
 
-This does not constitute authenticated multi-account or live billing validation. Linux CI remains pending before publication; initial real-account isolation on Windows and Linux is unverified until opt-in live validation.
+The [Windows and Ubuntu CI run](https://github.com/jox218-source/Remora/actions/runs/35454019012) passed on commit `f40e1ff`: Ubuntu passed all 26 tests; Windows passed 24 with two platform-specific skips. The full check includes type checking, lint, formatting, production builds, and Markdown links. Browser QA exercised demo creation, planning, approval, parallel workers, review, text/diff previews, and acceptance into its original test directory.
+
+This does not constitute authenticated multi-account or live billing validation. Real-account isolation on Windows and Linux is unverified until opt-in live validation; quota exhaustion and logout/refresh isolation with real accounts remain release gates.
 
 For live validation, use two already connected aliases and explicitly confirm usage:
 

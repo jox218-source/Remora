@@ -43,8 +43,8 @@ Demo agent responses are labeled `simulated` and never use credentials. Use `sta
 For real profiles, register and authenticate aliases after the service is running:
 
 ```bash
-npm run remora -- accounts add lead --provider codex --model MODEL
-npm run remora -- accounts add worker --provider codex --model MODEL
+npm run remora -- accounts add lead --provider codex
+npm run remora -- accounts add worker --provider codex
 npm run remora -- accounts login lead
 npm run remora -- accounts login worker
 ```
