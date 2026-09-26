@@ -14,6 +14,15 @@ In a second terminal, run `npm run remora -- status` to inspect the service. `np
 
 For a credential-free smoke workflow, run `npm run remora -- demo`, capture its project ID, then run `plan --goal`, `approve`, and `run`; every demo response is labeled `simulated`.
 
+To exercise project conversation without credentials, send a bounded question to both demo agents:
+
+```bash
+npm run remora -- message PROJECT_ID --to demo-one,demo-two --kind question --text "Confirm the offline exchange" --idempotency-key exchange-1
+npm run remora -- messages PROJECT_ID
+```
+
+The demo adapter records delivered and answered states and persists the request/reply history. Codex messages deliver only when the recipient has an active turn that acknowledges a steer; idle recipients stay visibly queued for a later safe point.
+
 Real accounts require the installed Codex CLI/app-server. Add aliases with `accounts add --provider codex`, then use `accounts login` for each alias; credentials remain managed by Codex. Before spending a model turn, verify both aliases with the read-only readiness check:
 
 ```bash

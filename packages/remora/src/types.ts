@@ -117,6 +117,40 @@ export type Event = {
   taskId?: string;
   account?: string;
 };
+export type MessageKind = 'update' | 'question' | 'answer' | 'blocker';
+export type MessageDeliveryStatus = 'queued' | 'sent' | 'delivered' | 'answered' | 'failed';
+export type MessageSender =
+  { kind: 'user'; id: 'user' } | { kind: 'agent'; id: string; role: 'lead' | 'worker' };
+export type MessageRecipient = {
+  account: string;
+  status: MessageDeliveryStatus;
+  reason?: string;
+  sentAt?: string;
+  deliveredAt?: string;
+  answeredAt?: string;
+};
+export type ProjectMessage = {
+  id: string;
+  projectId: string;
+  idempotencyKey?: string;
+  sender: MessageSender;
+  recipients: MessageRecipient[];
+  content: string;
+  kind: MessageKind;
+  replyTo?: string;
+  createdAt: string;
+};
+export type ProviderMessageResult = {
+  delivered: boolean;
+  reason?: string;
+  answer?: { content: string; kind?: 'answer' | 'update' };
+};
+export type ProjectMessageRequest = {
+  projectId: string;
+  message: ProjectMessage;
+  recipient: string;
+  signal?: AbortSignal;
+};
 export type Approval = {
   id: string;
   projectId: string;
@@ -140,15 +174,26 @@ export interface RunRequest {
   onSession(ref: SessionRef): void;
   onEvent(message: string): void;
   onIdentity?(identity: string | undefined, checkedAt: string): void;
+  /** Provider adapters may expose this only through an advertised, authenticated tool. */
+  sendProjectMessage?(input: unknown): ProjectMessage;
+  /** Provider adapters may read only this project conversation through the authenticated tool. */
+  readProjectMessages?(after?: string): ProjectMessage[];
 }
 export interface Provider {
-  readonly capabilities: { version: 1; sessions: boolean; usage: boolean; approvals: boolean };
+  readonly capabilities: {
+    version: 1;
+    sessions: boolean;
+    usage: boolean;
+    approvals: boolean;
+    projectMessaging?: boolean;
+  };
   status(account: Account): Promise<Partial<Account>>;
   models?(account: Account): Promise<ModelOption[]>;
   login(account: Account): Promise<unknown>;
   logout(account: Account): Promise<void>;
   run(request: RunRequest): Promise<string>;
   reconcile(ref: SessionRef): Promise<{ status: string; output?: string }>;
+  sendProjectMessage?(request: ProjectMessageRequest): Promise<ProviderMessageResult>;
   close(): Promise<void>;
 }
 export function validatePlan(plan: Plan, accounts: string[]): Plan {

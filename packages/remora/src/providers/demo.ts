@@ -1,11 +1,24 @@
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
-import type { Account, Provider, RunRequest, SessionRef } from '../types.js';
+import type {
+  Account,
+  Provider,
+  RunRequest,
+  SessionRef,
+  ProjectMessageRequest,
+  ProviderMessageResult,
+} from '../types.js';
 
 /** Deterministic offline fixture. Never calls a model or impersonates real account usage. */
 export class DemoProvider implements Provider {
-  readonly capabilities = { version: 1 as const, sessions: true, usage: false, approvals: false };
+  readonly capabilities = {
+    version: 1 as const,
+    sessions: true,
+    usage: false,
+    approvals: false,
+    projectMessaging: true,
+  };
   async status(_account: Account) {
     return {
       status: 'demo',
@@ -20,6 +33,18 @@ export class DemoProvider implements Provider {
   async logout(_account: Account) {}
   async reconcile(_ref: SessionRef) {
     return { status: 'unknown' };
+  }
+  async sendProjectMessage(request: ProjectMessageRequest): Promise<ProviderMessageResult> {
+    // This is a deterministic fixture for offline QA; it never starts a model turn.
+    if (request.message.kind === 'question')
+      return {
+        delivered: true,
+        answer: {
+          kind: 'answer',
+          content: `Offline demo reply from ${request.recipient}; no model call was made.`,
+        },
+      };
+    return { delivered: true };
   }
   async close() {}
   async run(run: RunRequest) {
