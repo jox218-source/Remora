@@ -37,10 +37,19 @@ export class Engine {
   private authBusy = new Set<string>();
   private statusBusy = new Set<string>();
   private loginPending = new Set<string>();
+  private pendingProviderOperations = new Set<Promise<unknown>>();
   private epochs = new Map<string, number>();
   private recovering = false;
   private timer: NodeJS.Timeout;
   private nextAccountRefresh = 0;
+  private trackProviderOperation<T>(operation: Promise<T>): Promise<T> {
+    this.pendingProviderOperations.add(operation);
+    operation.then(
+      () => this.pendingProviderOperations.delete(operation),
+      () => this.pendingProviderOperations.delete(operation),
+    );
+    return operation;
+  }
   constructor(
     readonly store: Store,
     providers?: Record<string, Provider>,
@@ -110,6 +119,10 @@ export class Engine {
     return account;
   }
   async refreshAccount(id: string) {
+    if (this.closing) return this.account(id);
+    return this.trackProviderOperation(this.refreshAccountImpl(id));
+  }
+  private async refreshAccountImpl(id: string) {
     const account = this.account(id);
     if (
       this.authBusy.has(id) ||
@@ -155,6 +168,10 @@ export class Engine {
     }
   }
   async models(id: string) {
+    if (this.closing) throw new Error('Remora is shutting down; retry after it starts again');
+    return this.trackProviderOperation(this.modelsImpl(id));
+  }
+  private async modelsImpl(id: string) {
     const account = this.account(id);
     const provider = this.providers[account.provider];
     if (!provider.models) return [];
@@ -182,6 +199,10 @@ export class Engine {
     );
   }
   async login(id: string) {
+    if (this.closing) throw new Error('Remora is shutting down; retry after it starts again');
+    return this.trackProviderOperation(this.loginImpl(id));
+  }
+  private async loginImpl(id: string) {
     if (this.busyAccount(id)) throw new Error('Account is busy');
     this.authBusy.add(id);
     this.bump(id);
@@ -200,6 +221,10 @@ export class Engine {
     }
   }
   async logout(id: string) {
+    if (this.closing) throw new Error('Remora is shutting down; retry after it starts again');
+    return this.trackProviderOperation(this.logoutImpl(id));
+  }
+  private async logoutImpl(id: string) {
     if (this.account(id).status === 'quarantined')
       throw new Error(
         'Account is quarantined; stop its provider processes and explicitly recover it first',
@@ -785,6 +810,7 @@ export class Engine {
     for (const active of this.active.values()) active.controller.abort();
     for (const approval of this.approvals.values()) approval.resolve('decline');
     await Promise.allSettled([...this.active.values()].map((a) => a.done));
+    await Promise.allSettled([...this.pendingProviderOperations]);
     await Promise.allSettled(Object.values(this.providers).map((p) => p.close()));
   }
 }

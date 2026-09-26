@@ -490,6 +490,78 @@ test('local API rejects unauthenticated, cross-origin and invalid-host requests'
   }
 });
 
+test('shutdown endpoint requires the local token and invokes the owner callback', async () => {
+  const f = fixture();
+  let shutdowns = 0;
+  const token = 'd'.repeat(64);
+  const app = await createServer(f.engine, token, 7437, () => {
+    shutdowns++;
+  });
+  const headers = { host: '127.0.0.1:7437' };
+  try {
+    assert.equal(
+      (await app.inject({ method: 'POST', url: '/api/shutdown', headers })).statusCode,
+      401,
+    );
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/shutdown',
+      headers: { ...headers, authorization: `Bearer ${token}` },
+    });
+    assert.equal(response.statusCode, 200);
+    await until(() => shutdowns === 1, 'shutdown callback');
+    const rejected = await app.inject({
+      method: 'POST',
+      url: '/api/accounts',
+      headers: { ...headers, authorization: `Bearer ${token}` },
+      payload: { id: 'after-shutdown', provider: 'demo' },
+    });
+    assert.equal(rejected.statusCode, 503);
+  } finally {
+    await app.close();
+    await f.cleanup();
+  }
+});
+
+test('engine shutdown drains deferred provider auth before closing providers', async () => {
+  let started = false;
+  let release!: () => void;
+  let markStarted!: () => void;
+  const startedSignal = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  let providerClosed = false;
+  class DeferredProvider extends DemoProvider {
+    override async login(account: any) {
+      started = true;
+      markStarted();
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return super.login(account);
+    }
+    override async close() {
+      providerClosed = true;
+    }
+  }
+  const f = fixture(new DeferredProvider());
+  try {
+    const login = f.engine.login('one');
+    await startedSignal;
+    assert.equal(started, true);
+    const closing = f.engine.close();
+    await setTimeout(20);
+    assert.equal(providerClosed, false);
+    await assert.rejects(() => f.engine.login('two'), /shutting down/);
+    release();
+    await login;
+    await closing;
+    assert.equal(providerClosed, true);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test('event logs redact common token and credential formats', () => {
   assert.equal(
     redact('api_key=top-secret-value sk-1234567890abcdef'),

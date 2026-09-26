@@ -11,9 +11,15 @@ import { safePath, manifest } from './workspace.js';
 
 const equal = (a: string, b: string) =>
   a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
-export async function createServer(engine: Engine, token: string, port = 7437) {
+export async function createServer(
+  engine: Engine,
+  token: string,
+  port = 7437,
+  onShutdown?: () => void | Promise<void>,
+) {
   const app = Fastify({ logger: false, bodyLimit: 1024 * 1024, requestTimeout: 30000 });
   const session = randomBytes(32).toString('hex');
+  let shuttingDown = false;
   const hosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
   app.addHook('onRequest', async (request, reply) => {
     reply.header('X-Content-Type-Options', 'nosniff');
@@ -28,6 +34,10 @@ export async function createServer(engine: Engine, token: string, port = 7437) {
     if (origin && ![`http://127.0.0.1:${port}`, `http://localhost:${port}`].includes(origin))
       return reply.code(403).send({ error: 'Cross-origin requests are not permitted' });
     if (request.url.startsWith('/api/')) {
+      if (shuttingDown && request.url.split('?')[0] !== '/api/shutdown')
+        return reply
+          .code(503)
+          .send({ error: 'Remora is shutting down; retry after it starts again' });
       reply.header('Cache-Control', 'no-store');
       if (request.url.split('?')[0] === '/api/session') return;
       const bearer = request.headers.authorization?.replace(/^Bearer /, '') ?? '';
@@ -59,6 +69,16 @@ export async function createServer(engine: Engine, token: string, port = 7437) {
     if (!equal(body.token, token)) return reply.code(401).send({ error: 'Invalid session token' });
     reply.header('Set-Cookie', `remora_session=${session}; HttpOnly; SameSite=Strict; Path=/`);
     return { ok: true };
+  });
+  app.post('/api/shutdown', async (_request, reply) => {
+    if (!onShutdown) return reply.code(503).send({ error: 'Shutdown is unavailable' });
+    reply.send({ ok: true });
+    shuttingDown = true;
+    queueMicrotask(() => {
+      void Promise.resolve(onShutdown()).catch(() => {
+        // The owning CLI reports shutdown failures in its foreground terminal.
+      });
+    });
   });
   app.get('/api/state', async () => engine.snapshot());
   app.post('/api/accounts', async (request) => engine.addAccount(request.body));

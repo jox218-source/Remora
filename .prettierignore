@@ -3,3 +3,5 @@ node_modules
 .cache
 package-lock.json
 LICENSE
+scripts/*.cmd
+scripts/*.sh

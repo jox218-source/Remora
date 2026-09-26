@@ -36,7 +36,24 @@ function runtime(): { port: number; token: string; pid: number } {
   const path = join(home(), 'runtime.json');
   if (!existsSync(path))
     throw new Error('Remora is not running. Run remora up in another terminal first.');
-  return JSON.parse(readFileSync(path, 'utf8'));
+  const value = JSON.parse(readFileSync(path, 'utf8')) as Partial<{
+    port: number;
+    token: string;
+    pid: number;
+  }>;
+  const { port, token, pid } = value;
+  if (
+    typeof port !== 'number' ||
+    !Number.isInteger(port) ||
+    port < 1024 ||
+    port > 65535 ||
+    typeof token !== 'string' ||
+    typeof pid !== 'number' ||
+    !Number.isInteger(pid) ||
+    pid <= 0
+  )
+    throw new Error(`Invalid Remora runtime record in ${path}`);
+  return { port, token, pid };
 }
 async function api(path: string, body?: unknown): Promise<any> {
   const state = runtime();
@@ -70,7 +87,10 @@ program
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'ESRCH') alive = false;
       }
-      if (alive) throw new Error('A Remora service already owns this home directory');
+      if (alive)
+        throw new Error(
+          'A Remora service already owns this home directory. Use remora status or remora stop from the same home.',
+        );
       rmSync(lock);
     }
     const fd = openSync(lock, 'wx', 0o600);
@@ -84,16 +104,24 @@ program
     const stop = async () => {
       if (stopping) return;
       stopping = true;
-      await engine.close();
       await app?.close();
+      await engine.close();
       store.close();
       if (existsSync(join(home(), 'runtime.json'))) rmSync(join(home(), 'runtime.json'));
       if (existsSync(lock)) rmSync(lock);
     };
     try {
       await engine.recover();
-      app = await createServer(engine, token, port);
-      await app.listen({ host: '127.0.0.1', port });
+      app = await createServer(engine, token, port, stop);
+      try {
+        await app.listen({ host: '127.0.0.1', port });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE')
+          throw new Error(
+            `Port ${port} is already in use. Choose another port with --port; Remora did not stop the other process.`,
+          );
+        throw error;
+      }
       writeFileSync(
         join(home(), 'runtime.json'),
         JSON.stringify({ port, token, pid: process.pid }),
@@ -114,6 +142,38 @@ program
       await stop();
       throw error;
     }
+  });
+program
+  .command('stop')
+  .description('Request a graceful stop from the Remora service for this home')
+  .action(async () => {
+    const state = runtime();
+    const lock = join(home(), 'service.lock');
+    if (!existsSync(lock) || Number(readFileSync(lock, 'utf8')) !== state.pid)
+      throw new Error('The runtime record is not owned by the service lock for this home');
+    try {
+      process.kill(state.pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH')
+        throw new Error('Remora is not running; its runtime record is stale.');
+      throw error;
+    }
+    const response = await fetch(`http://127.0.0.1:${state.port}/api/shutdown`, {
+      method: 'POST',
+      headers: {
+        Host: `127.0.0.1:${state.port}`,
+        Authorization: `Bearer ${state.token}`,
+      },
+    });
+    const data = (await response.json()) as { error?: string };
+    if (!response.ok) throw new Error(data.error ?? 'Remora rejected the shutdown request');
+    const deadline = Date.now() + 5000;
+    while (existsSync(join(home(), 'runtime.json')) && Date.now() < deadline) await setTimeout(50);
+    if (existsSync(join(home(), 'runtime.json')))
+      throw new Error(
+        'Shutdown was requested but the service is still running; press Ctrl+C in its terminal.',
+      );
+    output({ home: home(), status: 'stopped' });
   });
 program
   .command('doctor')
@@ -218,7 +278,27 @@ program
     output(await api(`/projects/${id}/retry`, { taskId: options.task })),
   );
 program.command('status [projectId]').action(async (id) => {
-  const state = await api('/state');
+  let state: any;
+  try {
+    state = await api('/state');
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('Remora is not running.')) {
+      output({ home: home(), status: 'stopped' });
+      return;
+    }
+    if (error instanceof TypeError && error.message.toLowerCase().includes('fetch')) {
+      try {
+        process.kill(runtime().pid, 0);
+      } catch (processError) {
+        if ((processError as NodeJS.ErrnoException).code === 'ESRCH') {
+          output({ home: home(), status: 'stopped', detail: 'stale runtime record' });
+          return;
+        }
+      }
+      throw new Error('The Remora service did not respond on its recorded local port.');
+    }
+    throw error;
+  }
   output(
     id
       ? {
