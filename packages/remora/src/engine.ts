@@ -24,7 +24,9 @@ export class Engine {
   readonly providers: Record<string, Provider>;
   readonly approvals = new Map<
     string,
-    Approval & { resolve(decision: 'accept' | 'decline'): void }
+    Approval & {
+      resolve(decision: 'accept' | 'acceptForSession' | 'decline'): void;
+    }
   >();
   private active = new Map<
     string,
@@ -33,10 +35,22 @@ export class Engine {
   private ticking = false;
   private closing = false;
   private authBusy = new Set<string>();
+  private statusBusy = new Set<string>();
+  private statusOperations = new Map<string, Promise<Account>>();
   private loginPending = new Set<string>();
+  private pendingProviderOperations = new Set<Promise<unknown>>();
   private epochs = new Map<string, number>();
   private recovering = false;
   private timer: NodeJS.Timeout;
+  private nextAccountRefresh = 0;
+  private trackProviderOperation<T>(operation: Promise<T>): Promise<T> {
+    this.pendingProviderOperations.add(operation);
+    operation.then(
+      () => this.pendingProviderOperations.delete(operation),
+      () => this.pendingProviderOperations.delete(operation),
+    );
+    return operation;
+  }
   constructor(
     readonly store: Store,
     providers?: Record<string, Provider>,
@@ -58,6 +72,10 @@ export class Engine {
     };
     this.timer = setInterval(() => {
       void this.tick();
+      if (Date.now() >= this.nextAccountRefresh) {
+        this.nextAccountRefresh = Date.now() + 30_000;
+        void this.refreshAccounts();
+      }
     }, 250);
     this.timer.unref();
   }
@@ -102,24 +120,98 @@ export class Engine {
     return account;
   }
   async refreshAccount(id: string) {
+    if (this.closing) return this.account(id);
+    const pending = this.statusOperations.get(id);
+    if (pending) return pending;
+    const operation = this.trackProviderOperation(this.refreshAccountImpl(id));
+    this.statusOperations.set(id, operation);
+    operation.then(
+      () => this.statusOperations.delete(id),
+      () => this.statusOperations.delete(id),
+    );
+    return operation;
+  }
+  private async refreshAccountImpl(id: string) {
     const account = this.account(id);
-    if (this.authBusy.has(id) || this.loginPending.has(id) || account.status === 'quarantined')
+    if (
+      this.authBusy.has(id) ||
+      this.loginPending.has(id) ||
+      this.statusBusy.has(id) ||
+      account.status === 'quarantined'
+    )
       return account;
+    this.statusBusy.add(id);
     const epoch = this.epochs.get(id) ?? 0;
     try {
-      Object.assign(account, await this.providers[account.provider].status(account));
+      const observed = await this.providers[account.provider].status(account);
+      const bound = account.boundIdentity ?? account.identity;
+      if (bound && observed.identity && bound.toLowerCase() !== observed.identity.toLowerCase()) {
+        account.status = 'identity-mismatch';
+        account.observedIdentity = observed.identity;
+        account.usage = observed.usage;
+        account.checkedAt = observed.checkedAt;
+        this.store.log('account', `Identity mismatch for ${id}; explicit rebind required`);
+      } else {
+        Object.assign(account, observed);
+        if (observed.identity && !account.boundIdentity) {
+          account.boundIdentity = observed.identity;
+          account.identity = observed.identity;
+        }
+      }
+      const current = this.store.list<Account>('accounts').find((a) => a.id === id);
+      if (!current || epoch !== (this.epochs.get(id) ?? 0) || current.status === 'quarantined')
+        return current ?? { ...account, status: 'removed' };
+      this.store.put('accounts', account);
+      return account;
     } catch (error) {
+      const current = this.store.list<Account>('accounts').find((a) => a.id === id);
+      if (!current || epoch !== (this.epochs.get(id) ?? 0) || current.status === 'quarantined')
+        return current ?? { ...account, status: 'removed' };
       account.status = 'unavailable';
-      account.checkedAt = new Date().toISOString();
+      account.usage = null;
       this.store.log('account', error instanceof Error ? error.message : 'Account unavailable');
+      this.store.put('accounts', account);
+      return account;
+    } finally {
+      this.statusBusy.delete(id);
     }
-    const current = this.store.list<Account>('accounts').find((a) => a.id === id);
-    if (!current || epoch !== (this.epochs.get(id) ?? 0))
-      return current ?? { ...account, status: 'removed' };
+  }
+  async models(id: string) {
+    if (this.closing) throw new Error('Remora is shutting down; retry after it starts again');
+    return this.trackProviderOperation(this.modelsImpl(id));
+  }
+  private async modelsImpl(id: string) {
+    const account = this.account(id);
+    const provider = this.providers[account.provider];
+    if (!provider.models) return [];
+    return provider.models(account);
+  }
+  updateAccountModel(id: string, model?: string | null) {
+    const account = this.account(id);
+    if (
+      this.authBusy.has(id) ||
+      this.loginPending.has(id) ||
+      account.status === 'quarantined' ||
+      [...this.active.values()].some((active) => active.account === id)
+    )
+      throw new Error('Account is busy; wait for active work to finish');
+    if (model != null && !model.trim()) throw new Error('Model must be a non-empty string');
+    account.model = model == null ? undefined : model.trim();
+    this.bump(id);
     this.store.put('accounts', account);
+    this.store.log('account', `Updated model selection for ${id}`);
     return account;
   }
+  private async refreshAccounts() {
+    await Promise.allSettled(
+      this.store.list<Account>('accounts').map((account) => this.refreshAccount(account.id)),
+    );
+  }
   async login(id: string) {
+    if (this.closing) throw new Error('Remora is shutting down; retry after it starts again');
+    return this.trackProviderOperation(this.loginImpl(id));
+  }
+  private async loginImpl(id: string) {
     if (this.busyAccount(id)) throw new Error('Account is busy');
     this.authBusy.add(id);
     this.bump(id);
@@ -138,6 +230,10 @@ export class Engine {
     }
   }
   async logout(id: string) {
+    if (this.closing) throw new Error('Remora is shutting down; retry after it starts again');
+    return this.trackProviderOperation(this.logoutImpl(id));
+  }
+  private async logoutImpl(id: string) {
     if (this.account(id).status === 'quarantined')
       throw new Error(
         'Account is quarantined; stop its provider processes and explicitly recover it first',
@@ -190,6 +286,7 @@ export class Engine {
         workers: z.array(aliasSchema).min(1),
         maxConcurrency: z.number().int().min(1).max(16).default(4),
         network: z.boolean().default(false),
+        approvalPolicy: z.enum(['on-request', 'never']).default('on-request'),
       })
       .parse(input);
     [data.lead, ...data.workers].forEach((id) => this.account(id));
@@ -202,6 +299,7 @@ export class Engine {
       goal: '',
       tasks: [],
       maxRevisions: 2,
+      approvalPolicy: data.approvalPolicy,
       createdAt: new Date().toISOString(),
     };
     this.save(project);
@@ -235,6 +333,7 @@ export class Engine {
           cwd: this.workspaces.directory(project, 'input'),
           readOnly: true,
           signal,
+          role: 'planner',
           prompt: `Plan this project. Do not execute tasks. Use only the eligible account aliases. Return JSON matching the schema. Tasks must have explicit acceptance criteria and an acyclic dependency graph. Keep tasks small and avoid simultaneous edits to the same file.\nGOAL: ${goal}\nELIGIBLE_ACCOUNTS=${JSON.stringify(project.workers)}\nTasks may include research, writing, or coding. Each task runs in a separate workspace.`,
           schema: z.toJSONSchema(planSchema),
           onSession: (ref) => {
@@ -264,6 +363,38 @@ export class Engine {
     project.state = 'approved';
     this.save(project);
     this.store.log('approval', 'User approved the plan and configured workspace permissions', id);
+    return project;
+  }
+  updateTeam(id: string, lead: string, workers: string[]) {
+    const project = this.project(id);
+    if (!['idle', 'draft', 'paused'].includes(project.state))
+      throw new Error('Team changes are only allowed for idle, draft, or paused projects');
+    if (
+      project.state === 'paused' &&
+      [...this.active.values()].some((active) => active.projectId === id)
+    )
+      throw new Error('Wait for active project work to settle before changing its team');
+    const uniqueWorkers = [...new Set(workers)];
+    if (!uniqueWorkers.length) throw new Error('Choose at least one worker account');
+    this.account(lead);
+    uniqueWorkers.forEach((account) => this.account(account));
+    if (project.state === 'draft') {
+      delete project.plan;
+      project.tasks = [];
+      project.state = 'idle';
+      project.error = 'Team changed; create a new plan before running this project';
+    } else if (project.state === 'paused') {
+      const eligible = new Set(uniqueWorkers);
+      const queued = project.tasks.filter((task) =>
+        ['pending', 'review', 'reviewing', 'running', 'interrupted'].includes(task.status),
+      );
+      if (queued.some((task) => !eligible.has(task.account)))
+        throw new Error('The new worker team does not include an account assigned to queued work');
+    }
+    project.lead = lead;
+    project.workers = uniqueWorkers;
+    this.save(project);
+    this.store.log('team', `Updated project lead and worker team`, id);
     return project;
   }
   start(id: string) {
@@ -360,7 +491,7 @@ export class Engine {
     project: Project,
     accountId: string,
     options: Pick<RunRequest, 'cwd' | 'prompt' | 'readOnly' | 'signal' | 'onSession'> &
-      Partial<RunRequest>,
+      Partial<RunRequest> & { role: 'planner' | 'worker' | 'reviewer' },
   ) {
     const account = this.account(accountId);
     return this.providers[account.provider]
@@ -369,7 +500,21 @@ export class Engine {
         projectId: project.id,
         account,
         network: project.network,
-        onEvent: (message) => this.store.log('provider', message, project.id, options.taskId),
+        approvalPolicy: project.approvalPolicy ?? 'on-request',
+        onEvent: (message) =>
+          this.store.log('provider', message, project.id, options.taskId, accountId),
+        onIdentity: (identity, checkedAt) => {
+          const current = this.project(project.id);
+          const evidence = { account: accountId, identity, checkedAt, role: options.role };
+          if (options.taskId) {
+            const task = current.tasks.find((item) => item.id === options.taskId);
+            if (task) {
+              if (options.role === 'reviewer') task.reviewerIdentityEvidence = evidence;
+              else task.workerIdentityEvidence = evidence;
+            }
+          } else current.planningIdentityEvidence = evidence;
+          this.save(current);
+        },
       })
       .catch((error) => {
         if (error instanceof Error && error.message.includes('Unconfirmed provider shutdown')) {
@@ -479,6 +624,7 @@ export class Engine {
         prompt,
         readOnly: review,
         signal,
+        role: review ? 'reviewer' : 'worker',
         taskId,
         ...(review ? { schema: z.toJSONSchema(reviewSchema) } : {}),
         onSession: (ref) => {
@@ -535,11 +681,11 @@ export class Engine {
     run: RunRequest,
     method: string,
     details: unknown,
-  ): Promise<'accept' | 'decline'> {
+  ): Promise<'accept' | 'acceptForSession' | 'decline'> {
     return new Promise((resolve) => {
       const id = randomUUID();
       const abort = () => finish('decline');
-      const finish = (decision: 'accept' | 'decline') => {
+      const finish = (decision: 'accept' | 'acceptForSession' | 'decline') => {
         this.approvals.delete(id);
         run.signal.removeEventListener('abort', abort);
         resolve(decision);
@@ -564,13 +710,20 @@ export class Engine {
       );
     });
   }
-  decide(id: string, decision: 'accept' | 'decline') {
+  decide(id: string, decision: 'accept' | 'acceptForSession' | 'decline') {
     const approval = this.approvals.get(id);
     if (!approval) throw new Error('Approval is no longer pending');
+    const available = (approval.details as { availableDecisions?: unknown }).availableDecisions;
+    if (
+      decision === 'acceptForSession' &&
+      Array.isArray(available) &&
+      !available.includes(decision)
+    )
+      throw new Error('The provider did not offer session approval for this request');
     approval.resolve(decision);
     this.store.log(
       'permission',
-      `User ${decision === 'accept' ? 'approved' : 'declined'} one provider request`,
+      `User ${decision === 'decline' ? 'declined' : decision === 'acceptForSession' ? 'approved provider requests for this task session' : 'approved one provider request'}`,
       approval.projectId,
       approval.taskId,
     );
@@ -666,6 +819,7 @@ export class Engine {
     for (const active of this.active.values()) active.controller.abort();
     for (const approval of this.approvals.values()) approval.resolve('decline');
     await Promise.allSettled([...this.active.values()].map((a) => a.done));
+    await Promise.allSettled([...this.pendingProviderOperations]);
     await Promise.allSettled(Object.values(this.providers).map((p) => p.close()));
   }
 }

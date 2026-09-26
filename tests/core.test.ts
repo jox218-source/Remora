@@ -274,6 +274,174 @@ test('recovery never silently reruns an uncertain task', async () => {
   }
 });
 
+test('restart recovery preserves an interrupted task for explicit retry', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'remora-restart-'));
+  const home = join(dir, 'state');
+  const root = join(dir, 'project');
+  mkdirSync(root);
+  writeFileSync(join(root, 'BRIEF.md'), 'Restart recovery fixture');
+  let runs = 0;
+  class RestartProvider extends DemoProvider {
+    override async run(run: RunRequest) {
+      runs++;
+      return super.run(run);
+    }
+  }
+  const provider = new RestartProvider();
+  const store1 = new Store(home);
+  const engine1 = new Engine(store1, { demo: provider });
+  engine1.addAccount({ id: 'one', provider: 'demo' });
+  const project = engine1.createProject({
+    root,
+    name: 'Restart recovery',
+    lead: 'one',
+    workers: ['one'],
+  });
+  project.goal = 'Preserve an interrupted task';
+  project.state = 'running';
+  project.plan = { summary: 'interrupted task', tasks: [{ ...plan.tasks[0], account: 'one' }] };
+  project.tasks = [
+    {
+      ...project.plan.tasks[0],
+      status: 'running',
+      revision: 0,
+      session: { account: 'one', threadId: 'unknown' },
+    },
+  ];
+  store1.put('projects', project);
+  await engine1.close();
+  store1.close();
+
+  const store2 = new Store(home);
+  const engine2 = new Engine(store2, { demo: provider });
+  try {
+    await engine2.recover();
+    const recovered = engine2.project(project.id);
+    assert.equal(recovered.state, 'blocked');
+    assert.equal(recovered.tasks[0].status, 'interrupted');
+    assert.equal(runs, 0);
+    assert.match(recovered.tasks[0].feedback ?? '', /Recovered provider status: unknown/);
+  } finally {
+    await engine2.close();
+    store2.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('sandbox-only projects pass fail-closed provider approval policy to every turn', async () => {
+  class CapturePolicy extends DemoProvider {
+    policies: Array<RunRequest['approvalPolicy']> = [];
+    override async run(run: RunRequest) {
+      this.policies.push(run.approvalPolicy);
+      return super.run(run);
+    }
+  }
+  const provider = new CapturePolicy();
+  const f = fixture(provider);
+  try {
+    f.project.approvalPolicy = 'never';
+    f.engine.save(f.project);
+    await f.engine.plan(f.project.id, 'Sandbox-only project', {
+      ...plan,
+      tasks: [plan.tasks[0]],
+    });
+    f.engine.approve(f.project.id);
+    f.engine.start(f.project.id);
+    await until(() => f.engine.project(f.project.id).state === 'ready');
+    assert.ok(provider.policies.length >= 2);
+    assert.ok(provider.policies.every((policy) => policy === 'never'));
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('account settings and team updates use bounded lifecycle guards', async () => {
+  const f = fixture();
+  const app = await createServer(f.engine, 'c'.repeat(64));
+  const headers = { host: '127.0.0.1:7437', authorization: `Bearer ${'c'.repeat(64)}` };
+  try {
+    const model = await app.inject({
+      method: 'POST',
+      url: '/api/accounts/one/settings',
+      headers,
+      payload: { model: 'fixture-model' },
+    });
+    assert.equal(model.statusCode, 200);
+    assert.equal(f.engine.account('one').model, 'fixture-model');
+    const clearedModel = await app.inject({
+      method: 'POST',
+      url: '/api/accounts/one/settings',
+      headers,
+      payload: { model: null },
+    });
+    assert.equal(clearedModel.statusCode, 200);
+    assert.equal(f.engine.account('one').model, undefined);
+    f.engine.updateTeam(f.project.id, 'two', ['one', 'two']);
+    assert.equal(f.engine.project(f.project.id).lead, 'two');
+
+    await f.engine.plan(f.project.id, 'Team edit invalidation', {
+      ...plan,
+      tasks: [plan.tasks[0]],
+    });
+    assert.equal(f.engine.project(f.project.id).state, 'draft');
+    f.engine.updateTeam(f.project.id, 'one', ['two']);
+    assert.equal(f.engine.project(f.project.id).state, 'idle');
+    assert.equal(f.engine.project(f.project.id).plan, undefined);
+    assert.equal(f.engine.project(f.project.id).tasks.length, 0);
+    const paused = f.engine.project(f.project.id);
+    paused.state = 'paused';
+    paused.tasks = [{ ...plan.tasks[0], status: 'review', revision: 0 }];
+    f.engine.save(paused);
+    assert.throws(
+      () => f.engine.updateTeam(f.project.id, 'two', ['two']),
+      /does not include an account assigned to queued work/,
+    );
+    paused.tasks = [];
+    paused.state = 'idle';
+    f.engine.save(paused);
+    f.engine.updateTeam(f.project.id, 'one', ['one', 'two']);
+
+    await f.engine.plan(f.project.id, 'Busy team edit', {
+      ...plan,
+      tasks: [plan.tasks[0]],
+    });
+    f.engine.approve(f.project.id);
+    f.engine.start(f.project.id);
+    await until(() => f.engine.project(f.project.id).tasks[0].status === 'running');
+    assert.throws(() => f.engine.updateTeam(f.project.id, 'two', ['two']), /only allowed/);
+    assert.throws(() => f.engine.updateAccountModel('one', 'blocked'), /busy/);
+  } finally {
+    await app.close();
+    await f.cleanup();
+  }
+});
+
+test('model selection survives a deferred account refresh', async () => {
+  let release!: () => void;
+  let entered!: () => void;
+  const started = new Promise<void>((resolve) => (entered = resolve));
+  const deferred = new Promise<void>((resolve) => (release = resolve));
+  class SlowStatus extends DemoProvider {
+    override async status(account: any) {
+      entered();
+      await deferred;
+      return super.status(account);
+    }
+  }
+  const f = fixture(new SlowStatus());
+  try {
+    const refresh = f.engine.refreshAccount('one');
+    await started;
+    f.engine.updateAccountModel('one', 'deferred-model');
+    release();
+    await refresh;
+    assert.equal(f.engine.account('one').model, 'deferred-model');
+  } finally {
+    release();
+    await f.cleanup();
+  }
+});
+
 test('local API rejects unauthenticated, cross-origin and invalid-host requests', async () => {
   const f = fixture(),
     token = 'a'.repeat(64);
@@ -322,11 +490,162 @@ test('local API rejects unauthenticated, cross-origin and invalid-host requests'
   }
 });
 
+test('shutdown endpoint requires the local token and invokes the owner callback', async () => {
+  const f = fixture();
+  let shutdowns = 0;
+  const token = 'd'.repeat(64);
+  const app = await createServer(f.engine, token, 7437, () => {
+    shutdowns++;
+  });
+  const headers = { host: '127.0.0.1:7437' };
+  try {
+    assert.equal(
+      (await app.inject({ method: 'POST', url: '/api/shutdown', headers })).statusCode,
+      401,
+    );
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/shutdown',
+      headers: { ...headers, authorization: `Bearer ${token}` },
+    });
+    assert.equal(response.statusCode, 200);
+    await until(() => shutdowns === 1, 'shutdown callback');
+    const rejected = await app.inject({
+      method: 'POST',
+      url: '/api/accounts',
+      headers: { ...headers, authorization: `Bearer ${token}` },
+      payload: { id: 'after-shutdown', provider: 'demo' },
+    });
+    assert.equal(rejected.statusCode, 503);
+  } finally {
+    await app.close();
+    await f.cleanup();
+  }
+});
+
+test('engine shutdown drains deferred provider auth before closing providers', async () => {
+  let started = false;
+  let release!: () => void;
+  let markStarted!: () => void;
+  const startedSignal = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  let providerClosed = false;
+  class DeferredProvider extends DemoProvider {
+    override async login(account: any) {
+      started = true;
+      markStarted();
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return super.login(account);
+    }
+    override async close() {
+      providerClosed = true;
+    }
+  }
+  const f = fixture(new DeferredProvider());
+  try {
+    const login = f.engine.login('one');
+    await startedSignal;
+    assert.equal(started, true);
+    const closing = f.engine.close();
+    await setTimeout(20);
+    assert.equal(providerClosed, false);
+    await assert.rejects(() => f.engine.login('two'), /shutting down/);
+    release();
+    await login;
+    await closing;
+    assert.equal(providerClosed, true);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test('event logs redact common token and credential formats', () => {
   assert.equal(
     redact('api_key=top-secret-value sk-1234567890abcdef'),
     'api_key=[REDACTED] [REDACTED]',
   );
+});
+
+test('provider events retain the account that performed the action', async () => {
+  const f = fixture();
+  try {
+    f.store.log('provider', 'Completed commandExecution', f.project.id, 'first', 'two');
+    assert.equal(f.store.logs(f.project.id).at(-1)?.account, 'two');
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('session approval is rejected when the provider did not advertise it', async () => {
+  const f = fixture();
+  try {
+    const pending = f.engine.requestApproval(
+      {
+        projectId: f.project.id,
+        account: f.engine.account('one'),
+        cwd: f.root,
+        prompt: 'test',
+        readOnly: true,
+        network: false,
+        signal: new AbortController().signal,
+        onSession() {},
+        onEvent() {},
+      },
+      'item/commandExecution/requestApproval',
+      { availableDecisions: ['accept', 'decline'] },
+    );
+    const approval = f.engine.snapshot().approvals[0];
+    assert.ok(approval);
+    assert.throws(() => f.engine.decide(approval.id, 'acceptForSession'), /did not offer/);
+    f.engine.decide(approval.id, 'decline');
+    await assert.doesNotReject(pending);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('local API forwards advertised session approval for command and file requests', async () => {
+  const f = fixture();
+  const app = await createServer(f.engine, 'b'.repeat(64));
+  const headers = { host: '127.0.0.1:7437', authorization: `Bearer ${'b'.repeat(64)}` };
+  try {
+    for (const method of [
+      'item/commandExecution/requestApproval',
+      'item/fileChange/requestApproval',
+    ]) {
+      const pending = f.engine.requestApproval(
+        {
+          projectId: f.project.id,
+          taskId: 'task',
+          account: f.engine.account('one'),
+          cwd: f.root,
+          prompt: 'test',
+          readOnly: false,
+          network: false,
+          signal: new AbortController().signal,
+          onSession() {},
+          onEvent() {},
+        },
+        method,
+        { availableDecisions: ['accept', 'acceptForSession', 'decline'] },
+      );
+      const approval = f.engine.snapshot().approvals.at(-1)!;
+      const response = await app.inject({
+        method: 'POST',
+        url: `/api/approvals/${approval.id}`,
+        headers,
+        payload: { decision: 'acceptForSession' },
+      });
+      assert.equal(response.statusCode, 200);
+      assert.equal(await pending, 'acceptForSession');
+    }
+  } finally {
+    await app.close();
+    await f.cleanup();
+  }
 });
 
 test('Windows account aliases cannot collide or use reserved device names', async () => {
@@ -398,6 +717,54 @@ test('late account refresh cannot resurrect a removed account', async () => {
     await f.engine.removeAccount('unused');
     await refresh;
     assert.throws(() => f.engine.account('unused'), /not found/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('concurrent account refreshes share one bounded provider status call', async () => {
+  class CountStatus extends DemoProvider {
+    calls = 0;
+    override async status(account: any) {
+      this.calls++;
+      await setTimeout(50);
+      return super.status(account);
+    }
+  }
+  const provider = new CountStatus();
+  const f = fixture(provider);
+  try {
+    await Promise.all([f.engine.refreshAccount('one'), f.engine.refreshAccount('one')]);
+    assert.equal(provider.calls, 1);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('failed deferred refresh cannot resurrect removal or overwrite quarantine', async () => {
+  class FailingStatus extends DemoProvider {
+    override async status(_account: any): Promise<never> {
+      await setTimeout(50);
+      throw new Error('provider unavailable');
+    }
+  }
+  const f = fixture(new FailingStatus());
+  try {
+    f.engine.addAccount({ id: 'refresh-remove', provider: 'demo' });
+    const removed = f.engine.refreshAccount('refresh-remove');
+    await setTimeout(5);
+    await f.engine.removeAccount('refresh-remove');
+    await removed;
+    assert.throws(() => f.engine.account('refresh-remove'), /not found/);
+
+    f.engine.addAccount({ id: 'refresh-quarantine', provider: 'demo' });
+    const quarantined = f.engine.refreshAccount('refresh-quarantine');
+    await setTimeout(5);
+    const account = f.engine.account('refresh-quarantine');
+    account.status = 'quarantined';
+    f.store.put('accounts', account);
+    await quarantined;
+    assert.equal(f.engine.account('refresh-quarantine').status, 'quarantined');
   } finally {
     await f.cleanup();
   }

@@ -1,13 +1,13 @@
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import type { Account, Provider, RunRequest, SessionRef } from '../types.js';
+import type { Account, ModelOption, Provider, RunRequest, SessionRef } from '../types.js';
 import { RpcClient } from './rpc.js';
 
 type RequestApproval = (
   run: RunRequest,
   method: string,
   params: unknown,
-) => Promise<'accept' | 'decline'>;
+) => Promise<'accept' | 'acceptForSession' | 'decline'>;
 export class CodexProvider implements Provider {
   readonly capabilities = { version: 1 as const, sessions: true, usage: true, approvals: true };
   private clients = new Map<string, Promise<RpcClient>>();
@@ -82,10 +82,57 @@ export class CodexProvider implements Provider {
     }
     return {
       status: result.account ? 'connected' : 'signed-out',
-      identity: result.account?.email ?? result.account?.type,
+      identity: result.account?.email,
+      authType: result.account?.type,
       usage: usage ?? null,
       checkedAt: new Date().toISOString(),
     };
+  }
+  async models(account: Account): Promise<ModelOption[]> {
+    const rpc = await this.client(account.id);
+    const models: ModelOption[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 10; page++) {
+      const result = (await rpc.request('model/list', {
+        includeHidden: false,
+        limit: 100,
+        ...(cursor ? { cursor } : {}),
+      })) as { data?: unknown[]; nextCursor?: unknown };
+      for (const value of result.data ?? []) {
+        if (!value || typeof value !== 'object') continue;
+        const model = value as Record<string, unknown>;
+        if (typeof model.id !== 'string' || typeof model.model !== 'string') continue;
+        const efforts = Array.isArray(model.supportedReasoningEfforts)
+          ? model.supportedReasoningEfforts.flatMap((effort) => {
+              if (!effort || typeof effort !== 'object') return [];
+              const option = effort as Record<string, unknown>;
+              return typeof option.reasoningEffort === 'string'
+                ? [
+                    {
+                      effort: option.reasoningEffort,
+                      ...(typeof option.description === 'string'
+                        ? { description: option.description }
+                        : {}),
+                    },
+                  ]
+                : [];
+            })
+          : [];
+        models.push({
+          id: model.id,
+          model: model.model,
+          displayName: typeof model.displayName === 'string' ? model.displayName : model.model,
+          description: typeof model.description === 'string' ? model.description : '',
+          supportedReasoningEfforts: efforts,
+          defaultReasoningEffort:
+            typeof model.defaultReasoningEffort === 'string' ? model.defaultReasoningEffort : '',
+          isDefault: model.isDefault === true,
+        });
+      }
+      cursor = typeof result.nextCursor === 'string' ? result.nextCursor : undefined;
+      if (!cursor) break;
+    }
+    return models;
   }
   async login(account: Account) {
     const result = await (
@@ -106,10 +153,31 @@ export class CodexProvider implements Provider {
   async run(run: RunRequest): Promise<string> {
     run.signal.throwIfAborted();
     const rpc = await this.client(run.account.id);
+    const observed = await this.status(run.account);
+    if (run.account.status === 'identity-mismatch')
+      throw new Error('Provider identity mismatch; explicitly rebind this account before running');
+    if (observed.status !== 'connected') throw new Error('Provider account is no longer connected');
+    const usage = observed.usage as
+      | {
+          ordinaryUsageAllowed?: unknown;
+        }
+      | null
+      | undefined;
+    if (usage?.ordinaryUsageAllowed === false)
+      throw new Error(
+        'Provider account usage allowance is exhausted; wait for its reset before retrying',
+      );
+    const boundIdentity = run.account.boundIdentity ?? run.account.identity;
+    if (
+      boundIdentity &&
+      (!observed.identity || boundIdentity.toLowerCase() !== observed.identity.toLowerCase())
+    )
+      throw new Error('Provider identity changed; refusing to start a turn for this account');
+    run.onIdentity?.(observed.identity, observed.checkedAt ?? new Date().toISOString());
     const start = await rpc.request('thread/start', {
       cwd: run.cwd,
       model: run.account.model ?? null,
-      approvalPolicy: 'on-request',
+      approvalPolicy: run.approvalPolicy ?? 'on-request',
       sandbox: run.readOnly ? 'read-only' : 'workspace-write',
       config: { 'features.multi_agent': false },
       developerInstructions:
@@ -164,6 +232,25 @@ export class CodexProvider implements Provider {
       const notify = (msg: any) => {
         const p = msg.params ?? {};
         if (p.threadId !== threadId) return;
+        const actionSummary = (phase: string) => {
+          const item = p.item ?? {};
+          const type = item.type ?? 'provider item';
+          const command = typeof item.command === 'string' ? item.command : undefined;
+          const cwd = typeof item.cwd === 'string' ? item.cwd : undefined;
+          const paths = Array.isArray(item.changes)
+            ? item.changes
+                .map((change: any) => (typeof change?.path === 'string' ? change.path : ''))
+                .filter(Boolean)
+                .slice(0, 8)
+                .join(', ')
+            : undefined;
+          const detail = command
+            ? ` command=${command.slice(0, 240)}${cwd ? ` cwd=${cwd}` : ''}`
+            : paths
+              ? ` paths=${paths}`
+              : '';
+          return `${phase} ${type}${detail}`;
+        };
         if (msg.method === 'item/agentMessage/delta') {
           messages.set(p.itemId, (messages.get(p.itemId) ?? '') + p.delta);
         }
@@ -172,8 +259,9 @@ export class CodexProvider implements Provider {
             messages.set(p.item.id, p.item.text);
             if (p.item.phase === 'final_answer') output = p.item.text;
           }
-          run.onEvent(`Completed ${p.item?.type ?? 'provider item'}`);
+          run.onEvent(actionSummary('Completed'));
         }
+        if (msg.method === 'item/started') run.onEvent(actionSummary('Started'));
         if (msg.method === 'turn/completed' && !terminating) {
           const turn = p.turn;
           if (turn?.status === 'completed') finish();
@@ -218,11 +306,17 @@ export class CodexProvider implements Provider {
           threadId,
           input: [{ type: 'text', text: run.prompt, text_elements: [] }],
           cwd: run.cwd,
-          approvalPolicy: 'on-request',
+          approvalPolicy: run.approvalPolicy ?? 'on-request',
           model: run.account.model ?? null,
           sandboxPolicy: run.readOnly
-            ? { type: 'readOnly' }
-            : { type: 'workspaceWrite', writableRoots: [run.cwd], networkAccess: run.network },
+            ? { type: 'readOnly', networkAccess: run.network }
+            : {
+                type: 'workspaceWrite',
+                writableRoots: [run.cwd],
+                networkAccess: run.network,
+                excludeTmpdirEnvVar: true,
+                excludeSlashTmp: true,
+              },
           ...(run.schema ? { outputSchema: run.schema } : {}),
         })
         .then((result) => {

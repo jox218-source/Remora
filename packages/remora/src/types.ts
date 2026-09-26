@@ -31,8 +31,20 @@ export type Account = {
   model?: string;
   status: string;
   identity?: string;
+  authType?: string;
+  boundIdentity?: string;
+  observedIdentity?: string;
   usage?: unknown;
   checkedAt?: string;
+};
+export type ModelOption = {
+  id: string;
+  model: string;
+  displayName: string;
+  description: string;
+  supportedReasoningEfforts: Array<{ effort: string; description?: string }>;
+  defaultReasoningEffort: string;
+  isDefault: boolean;
 };
 export type TaskStatus =
   | 'pending'
@@ -52,8 +64,16 @@ export type Task = TaskSpec & {
   result?: string;
   feedback?: string;
   session?: SessionRef;
+  workerIdentityEvidence?: IdentityEvidence;
+  reviewerIdentityEvidence?: IdentityEvidence;
 };
 export type SessionRef = { account: string; threadId: string; turnId?: string };
+export type IdentityEvidence = {
+  account: string;
+  identity?: string;
+  checkedAt: string;
+  role: 'planner' | 'worker' | 'reviewer';
+};
 export type Project = {
   id: string;
   name: string;
@@ -77,6 +97,7 @@ export type Project = {
   maxConcurrency: number;
   maxRevisions: number;
   network: boolean;
+  approvalPolicy?: 'on-request' | 'never';
   createdAt: string;
   error?: string;
   baseline?: Record<string, string>;
@@ -85,6 +106,7 @@ export type Project = {
   integrationBranch?: string;
   acceptedAt?: string;
   planningSession?: SessionRef;
+  planningIdentityEvidence?: IdentityEvidence;
 };
 export type Event = {
   id: number;
@@ -93,6 +115,7 @@ export type Event = {
   type: string;
   message: string;
   taskId?: string;
+  account?: string;
 };
 export type Approval = {
   id: string;
@@ -111,14 +134,17 @@ export interface RunRequest {
   prompt: string;
   readOnly: boolean;
   network: boolean;
+  approvalPolicy?: 'on-request' | 'never';
   schema?: Record<string, unknown>;
   signal: AbortSignal;
   onSession(ref: SessionRef): void;
   onEvent(message: string): void;
+  onIdentity?(identity: string | undefined, checkedAt: string): void;
 }
 export interface Provider {
   readonly capabilities: { version: 1; sessions: boolean; usage: boolean; approvals: boolean };
   status(account: Account): Promise<Partial<Account>>;
+  models?(account: Account): Promise<ModelOption[]>;
   login(account: Account): Promise<unknown>;
   logout(account: Account): Promise<void>;
   run(request: RunRequest): Promise<string>;

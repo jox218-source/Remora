@@ -20,6 +20,8 @@
     "format": "prettier --write .",
     "test": "tsx --test tests/*.test.ts",
     "check": "npm run typecheck && npm run lint && npm test && npm run build && node scripts/check-docs.mjs",
+    "setup": "node scripts/setup.mjs",
+    "start": "node scripts/start.mjs",
     "remora": "node packages/remora/dist/cli.js",
     "dev": "tsx packages/remora/src/cli.ts up",
     "test:live": "tsx scripts/live-smoke.ts",
