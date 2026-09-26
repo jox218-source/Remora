@@ -36,6 +36,7 @@ export class Engine {
   private closing = false;
   private authBusy = new Set<string>();
   private statusBusy = new Set<string>();
+  private statusOperations = new Map<string, Promise<Account>>();
   private loginPending = new Set<string>();
   private pendingProviderOperations = new Set<Promise<unknown>>();
   private epochs = new Map<string, number>();
@@ -120,7 +121,15 @@ export class Engine {
   }
   async refreshAccount(id: string) {
     if (this.closing) return this.account(id);
-    return this.trackProviderOperation(this.refreshAccountImpl(id));
+    const pending = this.statusOperations.get(id);
+    if (pending) return pending;
+    const operation = this.trackProviderOperation(this.refreshAccountImpl(id));
+    this.statusOperations.set(id, operation);
+    operation.then(
+      () => this.statusOperations.delete(id),
+      () => this.statusOperations.delete(id),
+    );
+    return operation;
   }
   private async refreshAccountImpl(id: string) {
     const account = this.account(id);
