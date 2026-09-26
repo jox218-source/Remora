@@ -1,8 +1,8 @@
 # Remora
 
-Remora is a local, pre-alpha coordinator for work split across multiple ChatGPT accounts. It runs as a TypeScript service with SQLite storage, a React dashboard, and a CLI. Its Codex provider adapter uses the installed, unmodified Codex app-server; Remora does not replace the Codex app, manage provider credentials itself, bypass provider limits, or send work to remote nodes.
+Remora is a local source alpha (`0.1.0-alpha.1`) for coordinating work across multiple ChatGPT accounts. It runs as a TypeScript service with SQLite storage, a React dashboard, and a CLI. Its Codex provider adapter uses the installed, unmodified Codex app-server; Remora does not replace the Codex app, manage provider credentials itself, bypass provider limits, or send work to remote nodes.
 
-The repository is pre-alpha. A two-alias authenticated pilot passed on Windows with normal provider approvals; Linux live isolation, quota exhaustion, and logout/refresh isolation remain untested. Claude, Grok, native subagents, and remote-node adapters are unsupported future work.
+This alpha is source-only and npm packages remain private. A two-alias authenticated pilot passed on Windows with normal provider approvals; Linux live isolation, quota exhaustion, and logout/refresh isolation remain untested. Claude, Grok, native subagents, and remote-node adapters are unsupported future work.
 
 ## Requirements
 
@@ -74,4 +74,4 @@ Start with [CONTRIBUTING.md](CONTRIBUTING.md), [docs/getting-started.md](docs/ge
 
 Remora is licensed under the [Apache License 2.0](LICENSE).
 
-Validation evidence and the remaining platform limitations are recorded in [docs/validation.md](docs/validation.md).
+Validation evidence and the remaining platform limitations are recorded in [docs/validation.md](docs/validation.md). The source-install and offline-demo release walkthrough is in [docs/release.md](docs/release.md).
