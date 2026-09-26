@@ -139,3 +139,121 @@ test('Codex adapter treats expired login and exhausted usage as unavailable in i
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test('Codex adapter advertises and serves authenticated Remora dynamic project tools', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'remora-dynamic-tools-'));
+  const sent: unknown[] = [];
+  const projectMessage = {
+    id: '00000000-0000-4000-8000-000000000001',
+    projectId: 'project-1',
+    idempotencyKey: 'fixture-dynamic-1',
+    sender: { kind: 'agent' as const, id: 'one', role: 'worker' as const },
+    recipients: [{ account: 'two', status: 'queued' as const }],
+    content: 'Fixture dynamic message',
+    kind: 'update' as const,
+    createdAt: new Date().toISOString(),
+  };
+  const provider = new CodexProvider(
+    home,
+    async () => 'decline',
+    () => {},
+    process.execPath,
+    [resolve('tests/fixtures/codex.mjs')],
+  );
+  const account = { id: 'one', provider: 'codex' as const, status: 'connected' };
+  const base = (prompt: string): RunRequest => ({
+    projectId: 'project-1',
+    taskId: 'task-1',
+    account,
+    cwd: home,
+    prompt,
+    readOnly: true,
+    network: false,
+    signal: new AbortController().signal,
+    onSession() {},
+    onEvent() {},
+    sendProjectMessage(input) {
+      sent.push(input);
+      return projectMessage;
+    },
+    readProjectMessages() {
+      return [projectMessage];
+    },
+  });
+  try {
+    assert.equal(await provider.run(base('DYNAMIC_SEND')), 'Dynamic tool response acknowledged');
+    const started = JSON.parse(
+      readFileSync(join(home, 'profiles', 'one', 'thread-start.json'), 'utf8'),
+    );
+    assert.deepEqual(
+      started.dynamicTools.map((tool: { name: string }) => tool.name),
+      ['remora_send_project_message', 'remora_read_project_messages'],
+    );
+    assert.deepEqual(sent, [
+      {
+        recipients: ['two'],
+        content: 'Fixture dynamic message',
+        kind: 'update',
+        idempotencyKey: 'fixture-dynamic-1',
+      },
+    ]);
+    const toolResult = JSON.parse(
+      readFileSync(join(home, 'profiles', 'one', 'tool-result.json'), 'utf8'),
+    );
+    assert.equal(toolResult.success, true);
+    assert.match(toolResult.contentItems[0].text, /messageId/);
+    assert.equal(await provider.run(base('DYNAMIC_READ')), 'Dynamic tool response acknowledged');
+    assert.equal(sent.length, 1);
+    assert.equal(
+      await provider.run(base('DYNAMIC_DUPLICATE')),
+      'Dynamic tool response acknowledged',
+    );
+    assert.equal(sent.length, 2);
+  } finally {
+    await provider.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Codex adapter rejects spoofed dynamic project tool fields and unknown scope', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'remora-dynamic-reject-'));
+  let sent = 0;
+  const provider = new CodexProvider(
+    home,
+    async () => 'decline',
+    () => {},
+    process.execPath,
+    [resolve('tests/fixtures/codex.mjs')],
+  );
+  const account = { id: 'one', provider: 'codex' as const, status: 'connected' };
+  try {
+    const result = await provider.run({
+      projectId: 'project-1',
+      taskId: 'task-1',
+      account,
+      cwd: home,
+      prompt: 'DYNAMIC_BAD_ARGS',
+      readOnly: true,
+      network: false,
+      signal: new AbortController().signal,
+      onSession() {},
+      onEvent() {},
+      sendProjectMessage() {
+        sent++;
+        throw new Error('must not be called');
+      },
+      readProjectMessages() {
+        return [];
+      },
+    });
+    assert.equal(result, 'Dynamic tool response failed');
+    assert.equal(sent, 0);
+    const toolResult = JSON.parse(
+      readFileSync(join(home, 'profiles', 'one', 'tool-result.json'), 'utf8'),
+    );
+    assert.equal(toolResult.success, false);
+  } finally {
+    await provider.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});

@@ -108,6 +108,13 @@ export async function createServer(
     return engine.updateAccountModel(request.params.id, body.model);
   });
   app.post('/api/projects', async (request) => engine.createProject(request.body));
+  app.get<{ Params: { id: string }; Querystring: { after?: string } }>(
+    '/api/projects/:id/messages',
+    async (request) => engine.messages(request.params.id, request.query.after),
+  );
+  app.post<{ Params: { id: string } }>('/api/projects/:id/messages', async (request) =>
+    engine.sendProjectMessage(request.params.id, request.body),
+  );
   app.post('/api/demo', async () => engine.demo());
   app.post<{ Params: { id: string } }>('/api/projects/:id/plan', async (request, reply) => {
     const body = z

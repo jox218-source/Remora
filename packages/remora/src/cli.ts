@@ -309,6 +309,36 @@ program.command('status [projectId]').action(async (id) => {
   );
 });
 program
+  .command('messages <projectId>')
+  .description('List durable project conversation messages and per-recipient delivery')
+  .option('--after <messageId>', 'Only messages after this stable message id')
+  .action(async (id, options) =>
+    output(
+      await api(
+        `/projects/${encodeURIComponent(id)}/messages${options.after ? `?after=${encodeURIComponent(options.after)}` : ''}`,
+      ),
+    ),
+  );
+program
+  .command('message <projectId>')
+  .description('Send a bounded project message; unsupported adapters leave it queued')
+  .requiredOption('--to <accounts>', 'Comma-separated project member aliases')
+  .requiredOption('--text <text>', 'Message text')
+  .option('--kind <kind>', 'update, question, answer, or blocker', 'update')
+  .option('--reply-to <messageId>', 'Stable message id being answered')
+  .option('--idempotency-key <key>', 'Retry key to prevent duplicate delivery')
+  .action(async (id, options) =>
+    output(
+      await api(`/projects/${encodeURIComponent(id)}/messages`, {
+        recipients: options.to.split(',').map((value: string) => value.trim()),
+        content: options.text,
+        kind: options.kind,
+        ...(options.replyTo ? { replyTo: options.replyTo } : {}),
+        ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+      }),
+    ),
+  );
+program
   .command('permission <approvalId>')
   .requiredOption('--decision <decision>', 'accept, acceptForSession, or decline')
   .action(async (id, options) =>

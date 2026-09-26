@@ -13,11 +13,17 @@ import {
   validatePlan,
   type Account,
   type Approval,
+  type MessageKind,
+  type ProjectMessage,
+  type MessageSender,
   type Plan,
   type Project,
   type Provider,
   type RunRequest,
 } from './types.js';
+
+const MAX_PROJECT_MESSAGES = 500;
+const MAX_REPLY_DEPTH = 8;
 
 export class Engine {
   readonly workspaces: Workspaces;
@@ -515,6 +521,14 @@ export class Engine {
           } else current.planningIdentityEvidence = evidence;
           this.save(current);
         },
+        sendProjectMessage: (input: unknown) =>
+          this.sendAgentMessage(
+            project.id,
+            accountId,
+            options.role === 'planner' || options.role === 'reviewer' ? 'lead' : 'worker',
+            input,
+          ),
+        readProjectMessages: (after?: string) => this.messages(project.id, after),
       })
       .catch((error) => {
         if (error instanceof Error && error.message.includes('Unconfirmed provider shutdown')) {
@@ -553,6 +567,10 @@ export class Engine {
     try {
       for (const project of this.listProjects().reverse()) {
         if (project.state !== 'running') continue;
+        for (const message of this.store.messages(project.id))
+          for (const recipient of message.recipients)
+            if (recipient.status === 'queued')
+              void this.dispatchProjectMessage(project.id, message.id, recipient.account);
         if (project.tasks.every((t) => t.status === 'accepted')) {
           try {
             this.workspaces.stage(project);
@@ -773,6 +791,201 @@ export class Engine {
   }
   results(id: string) {
     return this.workspaces.results(this.project(id));
+  }
+  messages(id: string, after?: string) {
+    this.project(id);
+    return this.store.messages(id, after);
+  }
+  private messageInput(input: unknown) {
+    return z
+      .object({
+        recipients: z
+          .array(z.union([aliasSchema, z.literal('user')]))
+          .min(1)
+          .max(8),
+        content: z.string().trim().min(1).max(4000),
+        kind: z.enum(['update', 'question', 'answer', 'blocker']).default('update'),
+        replyTo: z.string().uuid().optional(),
+        idempotencyKey: z.string().trim().min(1).max(120).optional(),
+      })
+      .parse(input);
+  }
+  private assertMessageRecipients(project: Project, recipients: string[]) {
+    const members = new Set([project.lead, ...project.workers]);
+    const unique = [...new Set(recipients)];
+    if (unique.length !== recipients.length) throw new Error('Recipients must be unique');
+    for (const recipient of recipients) {
+      if (recipient === 'user') continue;
+      if (!members.has(recipient))
+        throw new Error(`Recipient is not a project member: ${recipient}`);
+    }
+    return unique;
+  }
+  private createProjectMessage(
+    project: Project,
+    input: unknown,
+    sender: MessageSender,
+  ): ProjectMessage {
+    const data = this.messageInput(input);
+    if (project.state === 'cancelled')
+      throw new Error('Cannot send messages to a cancelled project');
+    const history = this.store.messages(project.id);
+    const duplicate = data.idempotencyKey
+      ? history.find((message) => message.idempotencyKey === data.idempotencyKey)
+      : undefined;
+    if (duplicate) return duplicate;
+    if (history.length >= MAX_PROJECT_MESSAGES)
+      throw new Error(`Project conversation limit reached (${MAX_PROJECT_MESSAGES} messages)`);
+    const recipients = this.assertMessageRecipients(project, data.recipients);
+    if (recipients.includes('user') && sender.kind !== 'agent')
+      throw new Error('Only an authenticated agent can address the user');
+    if (data.replyTo) {
+      const parent = history.find((message) => message.id === data.replyTo);
+      if (!parent) throw new Error('Reply target does not belong to this project');
+      let depth = 1;
+      let current = parent;
+      const seen = new Set<string>();
+      while (current.replyTo && !seen.has(current.id)) {
+        seen.add(current.id);
+        const ancestor = history.find((message) => message.id === current.replyTo);
+        if (!ancestor) break;
+        depth++;
+        current = ancestor;
+      }
+      if (depth >= MAX_REPLY_DEPTH)
+        throw new Error(`Reply chain limit reached (${MAX_REPLY_DEPTH} messages)`);
+    }
+    if (data.replyTo && data.kind === 'answer' && sender.kind === 'agent') {
+      const parent = history.find((message) => message.id === data.replyTo);
+      if (parent) {
+        this.store.updateMessage(parent.id, (current) => {
+          const item = current.recipients.find((entry) => entry.account === sender.id);
+          if (item) {
+            item.status = 'answered';
+            item.answeredAt = new Date().toISOString();
+            item.reason = 'Answered by the authenticated project agent';
+          }
+        });
+      }
+    }
+    const now = new Date().toISOString();
+    const message: ProjectMessage = {
+      id: randomUUID(),
+      projectId: project.id,
+      ...(data.idempotencyKey ? { idempotencyKey: data.idempotencyKey } : {}),
+      sender,
+      recipients: recipients.map((account) => ({
+        account,
+        status: account === 'user' ? 'delivered' : 'queued',
+        reason:
+          account === 'user'
+            ? 'Displayed to the authenticated project user'
+            : 'Queued; waiting for a provider that advertises project messaging',
+        ...(account === 'user' ? { deliveredAt: now } : {}),
+      })),
+      content: redact(data.content).slice(0, 4000),
+      kind: data.kind as MessageKind,
+      ...(data.replyTo ? { replyTo: data.replyTo } : {}),
+      createdAt: now,
+    };
+    const saved = this.store.putMessage(message);
+    this.store.log('message', `Project message ${saved.id} created`, project.id);
+    for (const recipient of saved.recipients)
+      void this.dispatchProjectMessage(saved.projectId, saved.id, recipient.account);
+    return saved;
+  }
+  sendProjectMessage(projectId: string, input: unknown) {
+    return this.createProjectMessage(this.project(projectId), input, { kind: 'user', id: 'user' });
+  }
+  sendAgentMessage(projectId: string, account: string, role: 'lead' | 'worker', input: unknown) {
+    const project = this.project(projectId);
+    if (![project.lead, ...project.workers].includes(account))
+      throw new Error('Agent is not a member of this project');
+    if (role === 'lead' && project.lead !== account)
+      throw new Error('Agent lead identity mismatch');
+    if (role === 'worker' && project.lead === account && !project.workers.includes(account))
+      throw new Error('Agent worker identity mismatch');
+    return this.createProjectMessage(project, input, { kind: 'agent', id: account, role });
+  }
+  private async dispatchProjectMessage(projectId: string, id: string, recipient: string) {
+    if (recipient === 'user') return;
+    const project = this.project(projectId);
+    if (project.state === 'cancelled') return;
+    if (project.state === 'paused') {
+      this.store.updateMessage(id, (current) => {
+        const item = current.recipients.find((entry) => entry.account === recipient);
+        if (item && item.status === 'queued')
+          item.reason = 'Queued while the project is paused; no new provider turn was started';
+      });
+      return;
+    }
+    const message = this.store.messages(projectId).find((item) => item.id === id);
+    if (!message) return;
+    const delivery = message.recipients.find((item) => item.account === recipient);
+    if (!delivery || delivery.status !== 'queued') return;
+    const account = this.account(recipient);
+    const provider = this.providers[account.provider];
+    if (!provider.capabilities.projectMessaging || !provider.sendProjectMessage) return;
+    this.store.updateMessage(id, (current) => {
+      const item = current.recipients.find((entry) => entry.account === recipient);
+      if (item) {
+        item.status = 'sent';
+        item.reason = 'Provider accepted the delivery request';
+        item.sentAt = new Date().toISOString();
+      }
+    });
+    try {
+      const result = await provider.sendProjectMessage({
+        projectId: message.projectId,
+        message,
+        recipient,
+      });
+      this.store.updateMessage(id, (current) => {
+        const item = current.recipients.find((entry) => entry.account === recipient);
+        if (!item) return;
+        // A provider-level negative receipt means the recipient did not receive it. Keep it
+        // queued for a later authenticated checkpoint; only an exception is terminal failure.
+        item.status = result.delivered ? 'delivered' : 'queued';
+        item.reason = result.reason;
+        if (result.delivered) item.deliveredAt = new Date().toISOString();
+      });
+      if (result.answer?.content) {
+        this.store.updateMessage(id, (current) => {
+          const item = current.recipients.find((entry) => entry.account === recipient);
+          if (item) {
+            item.status = 'answered';
+            item.answeredAt = new Date().toISOString();
+          }
+        });
+        const project = this.project(message.projectId);
+        const sender: MessageSender = {
+          kind: 'agent',
+          id: recipient,
+          role: project.lead === recipient ? 'lead' : 'worker',
+        };
+        const answerRecipient = message.sender.kind === 'agent' ? message.sender.id : 'user';
+        if (answerRecipient) {
+          this.createProjectMessage(
+            this.project(message.projectId),
+            {
+              recipients: [answerRecipient],
+              content: result.answer.content,
+              kind: result.answer.kind ?? 'answer',
+              replyTo: message.id,
+            },
+            sender,
+          );
+        }
+      }
+    } catch (error) {
+      this.store.updateMessage(id, (current) => {
+        const item = current.recipients.find((entry) => entry.account === recipient);
+        if (item) {
+          item.status = 'failed';
+          item.reason = redact(error instanceof Error ? error.message : String(error));
+        }
+      });
+    }
   }
   accept(id: string) {
     const project = this.project(id);

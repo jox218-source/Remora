@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
-import type { Account, Project, Event } from './types.js';
+import type { Account, Project, Event, ProjectMessage } from './types.js';
 
 export function redact(value: string): string {
   return value
@@ -24,6 +24,14 @@ export class Store {
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS project_messages (
+        id TEXT PRIMARY KEY,
+        projectId TEXT NOT NULL,
+        idempotencyKey TEXT,
+        data TEXT NOT NULL,
+        createdAt TEXT NOT NULL,
+        UNIQUE(projectId, idempotencyKey)
+      );
       CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL, projectId TEXT, type TEXT NOT NULL, message TEXT NOT NULL, taskId TEXT);
       INSERT OR IGNORE INTO meta VALUES ('schema_version','1');`);
     try {
@@ -31,6 +39,51 @@ export class Store {
     } catch {
       // Existing databases already have the account column.
     }
+    const schema = this.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get() as
+      { value?: string } | undefined;
+    if (schema?.value !== '2')
+      this.db.prepare("UPDATE meta SET value='2' WHERE key='schema_version'").run();
+  }
+  putMessage(message: ProjectMessage): ProjectMessage {
+    const existing = message.idempotencyKey
+      ? this.db
+          .prepare('SELECT data FROM project_messages WHERE projectId=? AND idempotencyKey=?')
+          .get(message.projectId, message.idempotencyKey)
+      : undefined;
+    if (existing) return JSON.parse((existing as { data: string }).data) as ProjectMessage;
+    this.db
+      .prepare(
+        'INSERT INTO project_messages(id,projectId,idempotencyKey,data,createdAt) VALUES (?,?,?,?,?)',
+      )
+      .run(
+        message.id,
+        message.projectId,
+        message.idempotencyKey ?? null,
+        JSON.stringify(message),
+        message.createdAt,
+      );
+    this.events.emit('message', message);
+    return message;
+  }
+  updateMessage(id: string, update: (message: ProjectMessage) => void): ProjectMessage {
+    const row = this.db.prepare('SELECT data FROM project_messages WHERE id=?').get(id);
+    if (!row) throw new Error(`Project message not found: ${id}`);
+    const message = JSON.parse((row as { data: string }).data) as ProjectMessage;
+    update(message);
+    this.db
+      .prepare('UPDATE project_messages SET data=? WHERE id=?')
+      .run(JSON.stringify(message), id);
+    this.events.emit('message', message);
+    return message;
+  }
+  messages(projectId: string, after?: string): ProjectMessage[] {
+    const rows = this.db
+      .prepare('SELECT data FROM project_messages WHERE projectId=? ORDER BY createdAt,id')
+      .all(projectId) as unknown as Array<{ data: string }>;
+    const messages = rows.map((row) => JSON.parse(row.data) as ProjectMessage);
+    if (!after) return messages;
+    const index = messages.findIndex((message) => message.id === after);
+    return index < 0 ? messages : messages.slice(index + 1);
   }
   list<T>(table: 'accounts' | 'projects'): T[] {
     return this.db

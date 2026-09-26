@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from 'react';
+import { FormEvent, useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   Activity,
@@ -6,8 +6,11 @@ import {
   ArrowRight,
   Check,
   ChevronRight,
+  Clock3,
   CirclePlay,
   ClipboardList,
+  CircleAlert,
+  CircleCheck,
   Download,
   ExternalLink,
   FileText,
@@ -18,6 +21,7 @@ import {
   LogIn,
   LogOut,
   Menu,
+  MessageCircle,
   MoreHorizontal,
   Pause,
   Play,
@@ -25,6 +29,7 @@ import {
   RefreshCw,
   RotateCcw,
   ShieldCheck,
+  Send,
   Sparkles,
   Terminal,
   UserRound,
@@ -117,6 +122,25 @@ type Event = {
   message?: string;
   projectId?: string;
   account?: string;
+};
+type MessageStatus = 'queued' | 'sent' | 'delivered' | 'answered' | 'failed';
+type ProjectMessageRecipient = {
+  account: string;
+  status: MessageStatus;
+  reason?: string;
+  sentAt?: string;
+  deliveredAt?: string;
+  answeredAt?: string;
+};
+type ProjectMessage = {
+  id: string;
+  projectId: string;
+  sender: { kind: 'user'; id: 'user' } | { kind: 'agent'; id: string; role: 'lead' | 'worker' };
+  recipients: ProjectMessageRecipient[];
+  content: string;
+  kind: 'update' | 'question' | 'answer' | 'blocker';
+  replyTo?: string;
+  createdAt: string;
 };
 type State = { accounts: Account[]; projects: Project[]; approvals: Approval[]; events: Event[] };
 
@@ -1427,6 +1451,16 @@ function ProjectDetail({
         <div className="detail-actions">
           <button
             className="button small secondary"
+            onClick={() =>
+              document
+                .getElementById('project-conversation')
+                ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+            }
+          >
+            <MessageCircle size={14} /> Conversation
+          </button>
+          <button
+            className="button small secondary"
             disabled={!teamEditable || busy === 'team'}
             title={
               teamEditable
@@ -1574,6 +1608,7 @@ function ProjectDetail({
           {project.error}
         </div>
       )}
+      <ProjectChat project={project} />
       <section className="panel task-panel">
         <div className="panel-title">
           <div>
@@ -1639,6 +1674,304 @@ function ProjectDetail({
     </div>
   );
 }
+function ProjectChat({ project }: { project: Project }) {
+  const members = [...new Set([project.lead, ...project.workers].filter(Boolean))];
+  const [messages, setMessages] = useState<ProjectMessage[]>([]);
+  const [recipient, setRecipient] = useState('all');
+  const [kind, setKind] = useState<'update' | 'question' | 'blocker'>('question');
+  const [content, setContent] = useState('');
+  const [replyTo, setReplyTo] = useState<string>();
+  const [threadRoot, setThreadRoot] = useState<string>();
+  const [loading, setLoading] = useState(true);
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState('');
+  const messagesRef = useRef<ProjectMessage[]>([]);
+  const cursorRef = useRef('');
+  const lastFullSyncRef = useRef(0);
+
+  const mergeMessages = (incoming: ProjectMessage[], replace = false) => {
+    if (replace) {
+      const next = incoming.slice(-80);
+      messagesRef.current = next;
+      setMessages(next);
+      cursorRef.current = next.at(-1)?.id || '';
+      return;
+    }
+    if (!incoming.length) return;
+    setMessages((current) => {
+      const byId = new Map(current.map((message) => [message.id, message]));
+      incoming.forEach((message) => byId.set(message.id, message));
+      const next = [...byId.values()]
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+        .slice(-80);
+      messagesRef.current = next;
+      cursorRef.current = next.at(-1)?.id || cursorRef.current;
+      return next;
+    });
+  };
+
+  const sync = async (full = false) => {
+    try {
+      const query =
+        full || !cursorRef.current ? '' : `?after=${encodeURIComponent(cursorRef.current)}`;
+      const incoming = await api<ProjectMessage[]>(
+        `/api/projects/${encodeURIComponent(project.id)}/messages${query}`,
+      );
+      mergeMessages(incoming, full || !cursorRef.current);
+      if (full) lastFullSyncRef.current = Date.now();
+      setError('');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Conversation is unavailable');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    setMessages([]);
+    messagesRef.current = [];
+    cursorRef.current = '';
+    lastFullSyncRef.current = 0;
+    setRecipient('all');
+    setKind('question');
+    setContent('');
+    setReplyTo(undefined);
+    setThreadRoot(undefined);
+    setError('');
+    setLoading(true);
+    void sync(true);
+    const timer = window.setInterval(() => {
+      const hasPending = messagesRef.current.some((message) =>
+        message.recipients.some((item) => item.status === 'queued' || item.status === 'sent'),
+      );
+      // Incremental reads keep normal polling light. A short full sync while delivery is pending
+      // lets the UI pick up status changes on the original message as well as new replies.
+      void sync(hasPending && Date.now() - lastFullSyncRef.current > 5000);
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [project.id]);
+
+  const byId = new Map(messages.map((message) => [message.id, message]));
+  const rootFor = (message: ProjectMessage) => {
+    let current = message;
+    const seen = new Set<string>();
+    while (current.replyTo && !seen.has(current.id)) {
+      seen.add(current.id);
+      const parent = byId.get(current.replyTo);
+      if (!parent) break;
+      current = parent;
+    }
+    return current.id;
+  };
+  const visibleMessages = threadRoot
+    ? messages.filter((message) => rootFor(message) === threadRoot)
+    : messages;
+  const selectedReply = replyTo ? byId.get(replyTo) : undefined;
+  const send = async (event: FormEvent) => {
+    event.preventDefault();
+    const trimmed = content.trim();
+    if (!trimmed || !members.length || sending) return;
+    const recipients = recipient === 'all' ? members : [recipient];
+    setSending(true);
+    setError('');
+    try {
+      const idempotencyKey =
+        typeof crypto !== 'undefined' && 'randomUUID' in crypto
+          ? crypto.randomUUID()
+          : `ui-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const message = await post<ProjectMessage>(
+        `/api/projects/${encodeURIComponent(project.id)}/messages`,
+        { recipients, content: trimmed, kind, ...(replyTo ? { replyTo } : {}), idempotencyKey },
+      );
+      mergeMessages([message]);
+      setContent('');
+      setReplyTo(undefined);
+      setThreadRoot(undefined);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Message could not be sent');
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <section className="panel project-chat" id="project-conversation">
+      <div className="panel-title project-chat-heading">
+        <div>
+          <span className="eyebrow">PROJECT CONVERSATION</span>
+          <h3>
+            <MessageCircle size={16} /> Talk with the project team
+          </h3>
+          <p>Messages stay with this project, so the latest context is here when you resume.</p>
+        </div>
+        {threadRoot && (
+          <button className="text-button" type="button" onClick={() => setThreadRoot(undefined)}>
+            Show all messages
+          </button>
+        )}
+      </div>
+      {error && (
+        <div className="chat-error">
+          <CircleAlert size={15} /> {error}
+        </div>
+      )}
+      <div className="chat-history" aria-live="polite">
+        {loading ? (
+          <div className="chat-empty">
+            <LoaderCircle className="spin" size={17} /> Loading conversation…
+          </div>
+        ) : !visibleMessages.length ? (
+          <div className="chat-empty">
+            <MessageCircle size={22} />
+            <strong>No messages yet</strong>
+            <span>Ask a project agent for an update or send context before resuming work.</span>
+          </div>
+        ) : (
+          visibleMessages.map((message) => {
+            const sender =
+              message.sender.kind === 'user'
+                ? 'You'
+                : `${message.sender.id} · ${label(message.sender.role)}`;
+            const parent = message.replyTo ? byId.get(message.replyTo) : undefined;
+            return (
+              <article
+                className={message.sender.kind === 'user' ? 'chat-message mine' : 'chat-message'}
+                key={message.id}
+              >
+                <div className="chat-message-meta">
+                  <strong>{sender}</strong>
+                  <span>{label(message.kind)}</span>
+                  <time dateTime={message.createdAt}>
+                    {new Date(message.createdAt).toLocaleString()}
+                  </time>
+                </div>
+                {parent && (
+                  <button
+                    className="chat-reply-link"
+                    type="button"
+                    onClick={() => setThreadRoot(rootFor(parent))}
+                  >
+                    Reply to {parent.sender.kind === 'user' ? 'your message' : parent.sender.id}
+                  </button>
+                )}
+                <p>{message.content}</p>
+                <div className="chat-message-footer">
+                  <div className="chat-statuses">
+                    {message.recipients.map((item) => (
+                      <span
+                        className={`chat-status ${item.status}`}
+                        key={`${message.id}-${item.account}`}
+                        title={item.reason || undefined}
+                      >
+                        {item.status === 'answered' ? (
+                          <CircleCheck size={12} />
+                        ) : item.status === 'failed' ? (
+                          <CircleAlert size={12} />
+                        ) : (
+                          <Clock3 size={12} />
+                        )}
+                        {item.account === 'user' ? 'You' : item.account}: {label(item.status)}
+                      </span>
+                    ))}
+                  </div>
+                  {message.recipients.length > 0 && (
+                    <button
+                      className="chat-reply-button"
+                      type="button"
+                      onClick={() => {
+                        setReplyTo(message.id);
+                        setThreadRoot(rootFor(message));
+                      }}
+                    >
+                      Reply
+                    </button>
+                  )}
+                </div>
+                {message.recipients.some((item) => item.status === 'queued' && item.reason) && (
+                  <small className="chat-queue-note">
+                    Queued while one or more selected agents are unavailable. Hover a status for
+                    details.
+                  </small>
+                )}
+              </article>
+            );
+          })
+        )}
+      </div>
+      <form className="chat-composer" onSubmit={send}>
+        {selectedReply && (
+          <div className="chat-replying">
+            <span>
+              Replying to{' '}
+              {selectedReply.sender.kind === 'user' ? 'your message' : selectedReply.sender.id}: “
+              {selectedReply.content.slice(0, 110)}
+              {selectedReply.content.length > 110 ? '…' : ''}”
+            </span>
+            <button type="button" aria-label="Cancel reply" onClick={() => setReplyTo(undefined)}>
+              <X size={14} />
+            </button>
+          </div>
+        )}
+        <div className="chat-composer-row">
+          <label>
+            Send to
+            <select
+              value={recipient}
+              onChange={(event) => setRecipient(event.target.value)}
+              disabled={!members.length || sending}
+            >
+              <option value="all">All project agents</option>
+              {members.map((member) => (
+                <option key={member} value={member}>
+                  {member}
+                  {member === project.lead ? ' · lead' : ' · worker'}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Message type
+            <select
+              value={kind}
+              onChange={(event) => setKind(event.target.value as typeof kind)}
+              disabled={sending}
+            >
+              <option value="question">Request a response</option>
+              <option value="update">Share an update</option>
+              <option value="blocker">Flag a blocker</option>
+            </select>
+          </label>
+        </div>
+        <div className="chat-input-row">
+          <textarea
+            value={content}
+            maxLength={4000}
+            onChange={(event) => setContent(event.target.value)}
+            placeholder="Write a short project message…"
+            disabled={!members.length || sending}
+            rows={3}
+          />
+          <button
+            className="button primary chat-send"
+            type="submit"
+            disabled={!content.trim() || !members.length || sending}
+          >
+            {sending ? <LoaderCircle className="spin" size={15} /> : <Send size={15} />} Send
+          </button>
+        </div>
+        <small className="chat-limit">
+          {content.length.toLocaleString()} / 4,000 characters · up to 8 recipients
+        </small>
+        {!members.length && (
+          <small className="chat-limit">
+            Add a lead or worker account to start a conversation.
+          </small>
+        )}
+      </form>
+    </section>
+  );
+}
+
 function TaskRow({ task, index }: { task: Task; index: number }) {
   const workerEvidence = task.workerIdentityEvidence;
   const reviewerEvidence = task.reviewerIdentityEvidence;

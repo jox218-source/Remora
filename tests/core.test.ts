@@ -84,6 +84,191 @@ test('plan validation rejects duplicate IDs, unknown accounts, dependencies and 
   );
 });
 
+test('project messages persist, deduplicate retries, enforce membership, and complete demo request/reply', async () => {
+  const f = fixture();
+  try {
+    const sent = f.engine.sendProjectMessage(f.project.id, {
+      recipients: ['one', 'two'],
+      content: 'Please confirm the offline exchange.',
+      kind: 'question',
+      idempotencyKey: 'exchange-1',
+    });
+    const duplicate = f.engine.sendProjectMessage(f.project.id, {
+      recipients: ['one', 'two'],
+      content: 'This retry must not duplicate.',
+      kind: 'question',
+      idempotencyKey: 'exchange-1',
+    });
+    assert.equal(duplicate.id, sent.id);
+    await until(() => f.engine.messages(f.project.id).length === 3, 'request and two replies');
+    const request = f.engine.messages(f.project.id).find((message) => message.id === sent.id)!;
+    assert.ok(request.recipients.every((recipient) => recipient.status === 'answered'));
+    assert.equal(
+      f.engine.messages(f.project.id).filter((message) => message.sender.kind === 'agent').length,
+      2,
+    );
+    assert.throws(
+      () =>
+        f.engine.sendProjectMessage(f.project.id, { recipients: ['outsider'], content: 'nope' }),
+      /not a project member/,
+    );
+    assert.equal(f.engine.messages(f.project.id).length, 3);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('unsupported providers leave project messages queued with an honest reason', async () => {
+  const provider = new DemoProvider();
+  (provider.capabilities as { projectMessaging?: boolean }).projectMessaging = false;
+  const f = fixture(provider);
+  try {
+    const message = f.engine.sendProjectMessage(f.project.id, {
+      recipients: ['one'],
+      content: 'Queue this safely',
+    });
+    await setTimeout(20);
+    const saved = f.engine.messages(f.project.id).find((item) => item.id === message.id)!;
+    assert.equal(saved.recipients[0].status, 'queued');
+    assert.match(saved.recipients[0].reason ?? '', /advertises project messaging/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('provider turns receive authenticated project send/read tools scoped to the project', async () => {
+  class MessagingDemo extends DemoProvider {
+    override async run(run: RunRequest) {
+      if (run.taskId && run.sendProjectMessage && run.readProjectMessages) {
+        const sent = run.sendProjectMessage({
+          recipients: ['two'],
+          content: 'Authenticated worker update',
+          kind: 'update',
+        });
+        assert.equal(sent.sender.kind, 'agent');
+        assert.equal(sent.sender.id, run.account.id);
+        assert.equal(
+          run.readProjectMessages().every((message) => message.projectId === run.projectId),
+          true,
+        );
+      }
+      return super.run(run);
+    }
+  }
+  const f = fixture(new MessagingDemo());
+  try {
+    await f.engine.plan(f.project.id, 'Tool callback scope', { ...plan, tasks: [plan.tasks[0]] });
+    f.engine.approve(f.project.id);
+    f.engine.start(f.project.id);
+    await until(() => f.engine.project(f.project.id).state === 'ready', 'tool callback project');
+    const messages = f.engine.messages(f.project.id);
+    assert.ok(
+      messages.some((message) => message.sender.kind === 'agent' && message.sender.id === 'one'),
+    );
+    assert.ok(messages.every((message) => message.projectId === f.project.id));
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('paused projects queue messages without starting a provider turn', async () => {
+  const f = fixture();
+  try {
+    const project = f.engine.project(f.project.id);
+    project.state = 'running';
+    f.engine.save(project);
+    f.engine.pause(project.id);
+    const message = f.engine.sendProjectMessage(project.id, {
+      recipients: ['one'],
+      content: 'Wait until resume',
+      kind: 'question',
+    });
+    await setTimeout(20);
+    const saved = f.engine.messages(project.id).find((item) => item.id === message.id)!;
+    assert.equal(saved.recipients[0].status, 'queued');
+    assert.match(saved.recipients[0].reason ?? '', /paused/);
+    f.engine.start(project.id);
+    await until(
+      () =>
+        f.engine.messages(project.id).find((item) => item.id === message.id)!.recipients[0]
+          .status === 'answered',
+      'queued message after resume',
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('project conversation history and queued receipts survive service restart', async () => {
+  const provider = new DemoProvider();
+  (provider.capabilities as { projectMessaging?: boolean }).projectMessaging = false;
+  const f = fixture(provider);
+  try {
+    const message = f.engine.sendProjectMessage(f.project.id, {
+      recipients: ['one'],
+      content: 'Persist this queued receipt',
+      idempotencyKey: 'restart-1',
+    });
+    await setTimeout(20);
+    const before = f.engine.messages(f.project.id).find((item) => item.id === message.id)!;
+    assert.equal(before.recipients[0].status, 'queued');
+    await f.engine.close();
+    f.store.close();
+    const store = new Store(f.home);
+    const restartedProvider = new DemoProvider();
+    (restartedProvider.capabilities as { projectMessaging?: boolean }).projectMessaging = false;
+    const restarted = new Engine(store, { demo: restartedProvider });
+    try {
+      const after = restarted.messages(f.project.id).find((item) => item.id === message.id);
+      assert.equal(after?.content, 'Persist this queued receipt');
+      assert.equal(after?.recipients[0].status, 'queued');
+    } finally {
+      await restarted.close();
+      store.close();
+    }
+  } finally {
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test('provider negative receipt stays queued until a later acknowledged delivery', async () => {
+  class ReceiptDemo extends DemoProvider {
+    allow = false;
+    calls = 0;
+    override async sendProjectMessage() {
+      this.calls++;
+      return this.allow
+        ? { delivered: true, reason: 'Fixture provider acknowledged delivery' }
+        : { delivered: false, reason: 'Recipient has no active provider turn' };
+    }
+  }
+  const provider = new ReceiptDemo();
+  const f = fixture(provider);
+  try {
+    const project = f.engine.project(f.project.id);
+    project.state = 'running';
+    f.engine.save(project);
+    const message = f.engine.sendProjectMessage(project.id, {
+      recipients: ['one'],
+      content: 'Wait for provider acknowledgement',
+    });
+    await until(() => provider.calls > 0, 'negative provider receipt');
+    assert.equal(
+      f.engine.messages(project.id).find((item) => item.id === message.id)?.recipients[0].status,
+      'queued',
+    );
+    provider.allow = true;
+    await until(
+      () =>
+        f.engine.messages(project.id).find((item) => item.id === message.id)?.recipients[0]
+          .status === 'delivered',
+      'acknowledged provider receipt',
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test('two parallel workers retain their workspaces and finish review before acceptance', async () => {
   const f = fixture();
   try {
@@ -484,6 +669,37 @@ test('local API rejects unauthenticated, cross-origin and invalid-host requests'
         .statusCode,
       400,
     );
+  } finally {
+    await app.close();
+    await f.cleanup();
+  }
+});
+
+test('local API exposes project conversation with authenticated user sender', async () => {
+  const f = fixture();
+  const token = 'e'.repeat(64);
+  const app = await createServer(f.engine, token);
+  const headers = { host: '127.0.0.1:7437', authorization: `Bearer ${token}` };
+  try {
+    const created = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${f.project.id}/messages`,
+      headers,
+      payload: {
+        recipients: ['one'],
+        content: 'API message',
+        kind: 'update',
+        idempotencyKey: 'api-1',
+      },
+    });
+    assert.equal(created.statusCode, 200);
+    assert.equal(created.json().sender.id, 'user');
+    const listed = await app.inject({
+      url: `/api/projects/${f.project.id}/messages`,
+      headers,
+    });
+    assert.equal(listed.statusCode, 200);
+    assert.equal(listed.json().length, 1);
   } finally {
     await app.close();
     await f.cleanup();
